@@ -1,17 +1,18 @@
 # SwiftKV
 
-> 基于自研 Raft 协议实现的分布式强一致性 KV 存储系统，支持多 Group 水平分片与在线安全迁移。
+> 基于自研 Raft 协议实现的分布式强一致性 KV 存储系统，支持水平分片、在线迁移与跨分片事务。
 
 [![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://go.dev/)
 [![gRPC](https://img.shields.io/badge/gRPC-1.79-244c5a?logo=google)](https://grpc.io/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker)](https://docs.docker.com/compose/)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-blue)](https://opensource.org/licenses/MIT)
 
 ---
 
 ## 核心特性
 
-- **自研 Raft 共识** — 选举、日志复制、快照压缩及崩溃恢复。异步持久化流水线解耦磁盘 I/O 与共识路径，**租约读**绕过 Raft 共识往返降低读延迟。
+- **自研 Raft 共识** — 选举、日志复制、快照压缩及崩溃恢复。增量持久化与异步流水线解耦磁盘 I/O 与共识路径，**租约读**绕过共识降低读延迟。
+- **跨分片 2PC 事务** — 零外部依赖（无 TSO/MVCC），事务决策经 Raft 共识持久化。乐观读校验 + 悲观写锁。CAS 批量写与事务标记在单个 BadgerDB 事务中原子落盘，Raft 日志重放安全。
 - **哈希槽分片路由** — 固定 1024 个哈希槽（类 Redis Cluster），xxhash 取模实现 O(1) Key→Group 路由，支持水平扩展与负载均衡。
 - **在线安全迁移** — 6 阶段 Shard 状态机（OWNED → MIGRATING → IMPORTING → ABSENT），迁移期间以双写保证 CP 语义，业务写入零中断。
 - **CAS 版本控制** — 乐观锁并发模型，Put 操作校验版本号，规避分布式环境下的丢失更新。
@@ -78,6 +79,14 @@ ck.Put("key", "value", 0)        // Create
 val, ver, _, _ := ck.Get("key")  // Read
 ck.Put("key", "newval", ver)     // Update (CAS)
 ck.Delete("key")                 // Delete
+
+// 跨分片事务
+h := ck.Begin()
+h.Put("alice", "40", 1)          // 缓冲写
+h.Put("bob",   "60", 1)
+if err := h.Commit(); err != OK { // 2PC：并行 Prepare → 并行 Commit
+    h.Rollback()
+}
 ```
 
 或使用 CLI：
@@ -98,10 +107,10 @@ bash scripts/test_perf.sh --groups 1 --replicas 3
 ## 架构概览
 
 ```
- Client (Clerk)                    Client (Clerk)
-      │                                  │
-      │  gRPC (KVService + ShardService) │
-      │                                  │
+ Client (Clerk / TxCoordinator)      Client (Clerk / TxCoordinator)
+      │                                          │
+      │  gRPC (KVService + ShardService)         │
+      │                                          │
   ┌───▼───────────────┐    ┌────────────▼───────────┐
   │     Group 1       │    │       Group 2           │
   │  ┌─────────────┐  │    │  ┌─────────────┐        │
@@ -111,13 +120,15 @@ bash scripts/test_perf.sh --groups 1 --replicas 3
   │         │ Raft RPC│    │         │               │
   │  ┌──────▼──────┐  │    │         │               │
   │  │  KVServer   │  │    │         │               │
-  │  │ ┌──────────┐ │  │    │         │               │
-  │  │ │ ShardMgr │ │  │    │         │               │
-  │  │ │ (6-phase)│ │  │    │         │               │
-  │  │ └──────────┘ │  │    │         │               │
-  │  │ ┌──────────┐ │  │    │         │               │
-  │  │ │ BadgerDB │ │  │    │         │               │
-  │  │ └──────────┘ │  │    │         │               │
+  │  │ ┌──────────┐│  │    │         │               │
+  │  │ │ TxManager││  │    │         │               │
+  │  │ │ (2PC参与)││  │    │         │               │
+  │  │ ├──────────┤│  │    │         │               │
+  │  │ │ ShardMgr ││  │    │         │               │
+  │  │ │ (6-phase)││  │    │         │               │
+  │  │ ├──────────┤│  │    │         │               │
+  │  │ │ BadgerDB ││  │    │         │               │
+  │  │ └──────────┘│  │    │         │               │
   │  └──────────────┘  │    │         │               │
   └────────────────────┘    └─────────────────────────┘
 ```
@@ -127,8 +138,8 @@ bash scripts/test_perf.sh --groups 1 --replicas 3
 | 包 | 职责 |
 |------|------|
 | `pkg/raft/` | Raft 共识：选举、日志复制、异步持久化、快照 |
-| `pkg/kv/` | KV 服务核心：Server、Clerk、RSM 桥接、gRPC、Shard 状态机 |
-| `pkg/sharding/` | 分片拓扑（1024 槽）、ShardRouter、在线迁移编排 |
+| `pkg/kv/` | KV 服务核心：Server、Clerk、RSM 桥接、gRPC、TxManager(2PC 参与者)、TxCoordinator(2PC 协调器)、Shard 状态机 |
+| `pkg/sharding/` | 分片拓扑（1024 槽）、ShardRouter、在线迁移编排（6 阶段）、事务路由 |
 | `pkg/storage/` | 基于 BadgerDB 的持久化封装 |
 | `pkg/watch/` | Key/Prefix 变更订阅与事件分发 |
 | `pkg/wal/` | 预写日志分段管理 |
@@ -154,6 +165,20 @@ ShardRouter ──► hash(key) % 1024 ──► Group ID ──► gRPC ──�
                                               Raft.Submit ──► 日志复制 ──► Commit
                                                               │
                                               BadgerDB.PutCASWithTTL ◄────┘
+```
+
+### 事务提交路径（2PC）
+
+```
+TxHandle.Commit()
+  │
+  ├─ Phase 1: PrepareTx ──► 所有涉及 Group（并行）
+  │     │                    TxManager 校验读集版本 → 加写锁 → 持久化 prepare 记录
+  │     └─ 任一失败？──► parallelAbort 全部已 Prepare 的 Group
+  │
+  └─ Phase 2: CommitTx  ──► 所有涉及 Group（并行，幂等重试）
+        │                    WriteBatchWithCASAndRecord 原子写用户数据 + commit 标记
+        └─ 释放锁，清理 prepare 记录
 ```
 
 ### 读取路径（租约优化）
