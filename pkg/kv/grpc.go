@@ -19,14 +19,13 @@ import (
 )
 
 // grpcKVService 将现有 KVServer 能力暴露为 gRPC 接口，
-// 同时实现 ShardServiceServer 以支持分片迁移管理。
+// SetShardState/GetShardStates 已合并到 KVService。
 type grpcKVService struct {
 	pb.UnimplementedKVServiceServer
-	pb.UnimplementedShardServiceServer
 	kv *KVServer
 }
 
-// SetShardState 实现 ShardServiceServer。由迁移协调器调用来修改 shard 状态。
+// SetShardState 实现 KVServiceServer。由迁移协调器调用来修改 shard 状态。
 func (s *grpcKVService) SetShardState(ctx context.Context, req *pb.SetShardStateRequest) (*pb.SetShardStateResponse, error) {
 	err := s.kv.SetShardState(int(req.GetShardId()), req.GetState(), int(req.GetTargetGroup()), req.GetTopologyEpoch(), nil)
 	if err != nil {
@@ -35,7 +34,7 @@ func (s *grpcKVService) SetShardState(ctx context.Context, req *pb.SetShardState
 	return &pb.SetShardStateResponse{}, nil
 }
 
-// GetShardStates 实现 ShardServiceServer。
+// GetShardStates 实现 KVServiceServer。
 func (s *grpcKVService) GetShardStates(ctx context.Context, req *pb.GetShardStatesRequest) (*pb.GetShardStatesResponse, error) {
 	entries, epoch := s.kv.GetShardStates()
 	return &pb.GetShardStatesResponse{States: entries, TopologyEpoch: epoch}, nil
@@ -239,6 +238,146 @@ func (s *grpcKVService) Watch(stream grpc.BidiStreamingServer[pb.WatchRequest, p
 	}
 }
 
+// convertReadKeysFromProto 将 proto ReadKey 转为内部 ReadKey 类型。
+func convertReadKeysFromProto(pbKeys []*pb.ReadKey) []ReadKey {
+	if pbKeys == nil {
+		return nil
+	}
+	keys := make([]ReadKey, 0, len(pbKeys))
+	for _, k := range pbKeys {
+		if k != nil {
+			keys = append(keys, ReadKey{Key: k.GetKey(), ExpectedVersion: Tversion(k.GetExpectedVersion())})
+		}
+	}
+	return keys
+}
+
+// convertWriteKeysFromProto 将 proto WriteKey 转为内部 WriteKey 类型。
+func convertWriteKeysFromProto(pbKeys []*pb.WriteKey) []WriteKey {
+	if pbKeys == nil {
+		return nil
+	}
+	keys := make([]WriteKey, 0, len(pbKeys))
+	for _, k := range pbKeys {
+		if k != nil {
+			keys = append(keys, WriteKey{Key: k.GetKey(), Value: k.GetValue(), Version: Tversion(k.GetVersion())})
+		}
+	}
+	return keys
+}
+
+// convertWriteKeysToProto 将内部 WriteKey 转为 proto 格式。
+func convertWriteKeysToProto(keys []WriteKey) []*pb.WriteKey {
+	if keys == nil {
+		return nil
+	}
+	pbKeys := make([]*pb.WriteKey, 0, len(keys))
+	for _, k := range keys {
+		pbKeys = append(pbKeys, &pb.WriteKey{Key: k.Key, Value: k.Value, Version: int64(k.Version)})
+	}
+	return pbKeys
+}
+
+func (s *grpcKVService) PrepareTx(ctx context.Context, req *pb.PrepareTxRequest) (*pb.PrepareTxResponse, error) {
+	if s.kv.killed() {
+		return &pb.PrepareTxResponse{Error: errReply(ErrWrongLeader)}, nil
+	}
+
+	args := &PrepareTxArgs{
+		TxID:      req.GetTxId(),
+		ReadKeys:  convertReadKeysFromProto(req.GetReadKeys()),
+		WriteKeys: convertWriteKeysFromProto(req.GetWriteKeys()),
+		TimeoutMs: req.GetTimeoutMs(),
+	}
+	err, ret := s.kv.rsm.Submit(args)
+	if err != OK {
+		return &pb.PrepareTxResponse{Error: errReply(err)}, nil
+	}
+
+	reply, ok := ret.(PrepareTxReply)
+	if !ok {
+		return &pb.PrepareTxResponse{Error: "ErrInternal"}, nil
+	}
+
+	return &pb.PrepareTxResponse{Error: errReply(reply.Err)}, nil
+}
+
+func (s *grpcKVService) CommitTx(ctx context.Context, req *pb.CommitTxRequest) (*pb.CommitTxResponse, error) {
+	if s.kv.killed() {
+		return &pb.CommitTxResponse{Error: errReply(ErrWrongLeader)}, nil
+	}
+
+	args := &CommitTxArgs{
+		TxID:      req.GetTxId(),
+		WriteKeys: convertWriteKeysFromProto(req.GetWriteKeys()),
+	}
+	err, ret := s.kv.rsm.Submit(args)
+	if err != OK {
+		return &pb.CommitTxResponse{Error: errReply(err)}, nil
+	}
+
+	reply, ok := ret.(CommitTxReply)
+	if !ok {
+		return &pb.CommitTxResponse{Error: "ErrInternal"}, nil
+	}
+
+	return &pb.CommitTxResponse{Error: errReply(reply.Err)}, nil
+}
+
+func (s *grpcKVService) AbortTx(ctx context.Context, req *pb.AbortTxRequest) (*pb.AbortTxResponse, error) {
+	if s.kv.killed() {
+		return &pb.AbortTxResponse{Error: errReply(ErrWrongLeader)}, nil
+	}
+
+	args := &AbortTxArgs{TxID: req.GetTxId()}
+	err, ret := s.kv.rsm.Submit(args)
+	if err != OK {
+		return &pb.AbortTxResponse{Error: errReply(err)}, nil
+	}
+
+	reply, ok := ret.(AbortTxReply)
+	if !ok {
+		return &pb.AbortTxResponse{Error: "ErrInternal"}, nil
+	}
+
+	return &pb.AbortTxResponse{Error: errReply(reply.Err)}, nil
+}
+
+func (s *grpcKVService) ResolveTxStatus(ctx context.Context, req *pb.ResolveTxStatusRequest) (*pb.ResolveTxStatusResponse, error) {
+	if s.kv.killed() {
+		return &pb.ResolveTxStatusResponse{Error: errReply(ErrWrongLeader)}, nil
+	}
+
+	args := &ResolveTxStatusArgs{TxID: req.GetTxId()}
+	// 注意：ResolveTxStatus 有副作用（超时自动 abort），必须走 Raft 共识路径
+	err, ret := s.kv.rsm.Submit(args)
+	if err != OK {
+		return &pb.ResolveTxStatusResponse{Error: errReply(err)}, nil
+	}
+
+	reply, ok := ret.(ResolveTxStatusReply)
+	if !ok {
+		return &pb.ResolveTxStatusResponse{Error: "ErrInternal"}, nil
+	}
+
+	statusStr := "NOT_FOUND"
+	switch reply.Status {
+	case TxStatusPrepared:
+		statusStr = "PREPARED"
+	case TxStatusCommitted:
+		statusStr = "COMMITTED"
+	case TxStatusAborted:
+		statusStr = "ABORTED"
+	}
+
+	return &pb.ResolveTxStatusResponse{
+		Status:     statusStr,
+		PreparedAt: reply.PreparedAt,
+		WriteKeys:  convertWriteKeysToProto(reply.WriteKeys),
+		Error:      errReply(reply.Err),
+	}, nil
+}
+
 func (s *grpcKVService) GetClusterStatus(ctx context.Context, req *pb.ClusterStatusRequest) (*pb.ClusterStatusResponse, error) {
 	term, isLeader := s.kv.rsm.GetState()
 	lastApplied := s.kv.rsm.GetLastApplied()
@@ -285,7 +424,6 @@ func StartGRPCServer(kv *KVServer, rpcAddr string) (*grpc.Server, net.Listener) 
 
 	svc := &grpcKVService{kv: kv}
 	pb.RegisterKVServiceServer(gs, svc)
-	pb.RegisterShardServiceServer(gs, svc)
 	go func() {
 		if serveErr := gs.Serve(lis); serveErr != nil {
 			log.Printf("grpc serve stopped on %s: %v", grpcAddr, serveErr)

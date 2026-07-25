@@ -23,6 +23,12 @@ service KVService {
   // 分片管理（迁移用）
   rpc SetShardState(SetShardStateRequest) returns (SetShardStateResponse);
   rpc GetShardStates(GetShardStatesRequest) returns (GetShardStatesResponse);
+
+  // 2PC 分布式事务
+  rpc PrepareTx(PrepareTxRequest) returns (PrepareTxResponse);
+  rpc CommitTx(CommitTxRequest) returns (CommitTxResponse);
+  rpc AbortTx(AbortTxRequest) returns (AbortTxResponse);
+  rpc ResolveTxStatus(ResolveTxStatusRequest) returns (ResolveTxStatusResponse);
 }
 
 // ============ 基础操作 ============
@@ -150,4 +156,56 @@ message GetShardStatesRequest {}
 message GetShardStatesResponse {
   repeated ShardStateEntry states = 1;
   int64 topology_epoch = 2;
+}
+
+// ============ 2PC 事务 ============
+
+message ReadKey {
+  string key = 1;
+  int64 expected_version = 2;
+}
+
+message WriteKey {
+  string key = 1;
+  string value = 2;
+  int64 version = 3;
+}
+
+message PrepareTxRequest {
+  string tx_id = 1;
+  repeated ReadKey read_keys = 2;
+  repeated WriteKey write_keys = 3;
+  int64 timeout_ms = 4;
+}
+
+message PrepareTxResponse {
+  string error = 1;
+}
+
+message CommitTxRequest {
+  string tx_id = 1;
+  repeated WriteKey write_keys = 2;
+}
+
+message CommitTxResponse {
+  string error = 1;
+}
+
+message AbortTxRequest {
+  string tx_id = 1;
+}
+
+message AbortTxResponse {
+  string error = 1;
+}
+
+message ResolveTxStatusRequest {
+  string tx_id = 1;
+}
+
+message ResolveTxStatusResponse {
+  string status = 1;         // "PREPARED", "COMMITTED", "ABORTED", "NOT_FOUND"
+  int64 prepared_at = 2;
+  repeated WriteKey write_keys = 3;
+  string error = 4;
 }

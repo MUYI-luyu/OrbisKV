@@ -319,8 +319,8 @@ func (m *Migrator) ExecutePlan(ctx context.Context, plan []MigrationPlanItem, de
 	return stats, nil
 }
 
-// connectToShardService 建立到指定 group 中第一个可达 replica 的 ShardService 连接。
-func connectToShardService(ctx context.Context, router *ShardRouter, gid int) (pb.ShardServiceClient, *grpc.ClientConn, error) {
+// connectToKVService 建立到指定 group 中第一个可达 replica 的 KVService 连接。
+func connectToKVService(ctx context.Context, router *ShardRouter, gid int) (pb.KVServiceClient, *grpc.ClientConn, error) {
 	addrs := router.groupReplicaAddrs(gid)
 	if len(addrs) == 0 {
 		return nil, nil, fmt.Errorf("group %d has no replicas", gid)
@@ -333,7 +333,7 @@ func connectToShardService(ctx context.Context, router *ShardRouter, gid int) (p
 		if err != nil {
 			continue
 		}
-		return pb.NewShardServiceClient(conn), conn, nil
+		return pb.NewKVServiceClient(conn), conn, nil
 	}
 	return nil, nil, fmt.Errorf("no reachable replica for group %d", gid)
 }
@@ -370,7 +370,7 @@ func (m *Migrator) MigrateShardOnline(ctx context.Context, shardID int, sourceGI
 
 	// 连接到源 group 和目标 group 的 server（用于调用 SetShardState）
 	srcCtx, srcCancel := context.WithTimeout(ctx, 5*time.Second)
-	src, srcConn, err := connectToShardService(srcCtx, m.source, sourceGID)
+	src, srcConn, err := connectToKVService(srcCtx, m.source, sourceGID)
 	srcCancel()
 	if err != nil {
 		return fmt.Errorf("connect to source group %d: %w", sourceGID, err)
@@ -378,7 +378,7 @@ func (m *Migrator) MigrateShardOnline(ctx context.Context, shardID int, sourceGI
 	defer srcConn.Close()
 
 	tgtCtx, tgtCancel := context.WithTimeout(ctx, 5*time.Second)
-	tgt, tgtConn, err := connectToShardService(tgtCtx, m.target, targetGID)
+	tgt, tgtConn, err := connectToKVService(tgtCtx, m.target, targetGID)
 	tgtCancel()
 	if err != nil {
 		return fmt.Errorf("connect to target group %d: %w", targetGID, err)

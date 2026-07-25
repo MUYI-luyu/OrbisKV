@@ -288,6 +288,22 @@ func walEntryFromOp(me int, commandIndex int, term int, oper Op) wal.Entry {
 		entry.OpType = "EXPIRE"
 		entry.Keys = append([]string(nil), t.Keys...)
 		entry.Cutoff = t.Cutoff
+	case *PrepareTxArgs, PrepareTxArgs:
+		t := reqPtr[PrepareTxArgs](oper.Req)
+		entry.OpType = "PREPARE_TX"
+		entry.Key = t.TxID
+	case *CommitTxArgs, CommitTxArgs:
+		t := reqPtr[CommitTxArgs](oper.Req)
+		entry.OpType = "COMMIT_TX"
+		entry.Key = t.TxID
+	case *AbortTxArgs, AbortTxArgs:
+		t := reqPtr[AbortTxArgs](oper.Req)
+		entry.OpType = "ABORT_TX"
+		entry.Key = t.TxID
+	case *ResolveTxStatusArgs, ResolveTxStatusArgs:
+		t := reqPtr[ResolveTxStatusArgs](oper.Req)
+		entry.OpType = "RESOLVE_TX_STATUS"
+		entry.Key = t.TxID
 	default:
 		entry.OpType = fmt.Sprintf("%T", oper.Req)
 	}
@@ -315,6 +331,14 @@ func walEntryToRequest(entry wal.Entry) (any, bool, error) {
 			Keys:   append([]string(nil), entry.Keys...),
 			Cutoff: entry.Cutoff,
 		}, true, nil
+	case "PREPARE_TX":
+		return &PrepareTxArgs{TxID: entry.Key}, true, nil
+	case "COMMIT_TX":
+		return &CommitTxArgs{TxID: entry.Key}, true, nil
+	case "ABORT_TX":
+		return &AbortTxArgs{TxID: entry.Key}, true, nil
+	case "RESOLVE_TX_STATUS":
+		return &ResolveTxStatusArgs{TxID: entry.Key}, false, nil
 	default:
 		if strings.Contains(entry.OpType, "GetArgs") || strings.Contains(entry.OpType, "ScanArgs") {
 			return nil, false, nil

@@ -13,8 +13,9 @@ import (
 // Clerk 是 KVraft 的分布式客户端。
 // 内部始终通过 ShardRouter 做路由——单 Raft 组自动退化为 1-group 路由。
 type Clerk struct {
-	servers []string       // Raft RPC 地址（调试用）
-	router  *sharding.ShardRouter
+	servers     []string       // Raft RPC 地址（调试用）
+	router      *sharding.ShardRouter
+	coordinator *TxCoordinator // 2PC 事务协调器
 }
 
 // backoffWithJitter 计算带抖动的指数退避延迟。
@@ -83,7 +84,7 @@ func MakeClerk(servers []string) *Clerk {
 	if err != nil {
 		panic(fmt.Sprintf("MakeClerk: %v", err))
 	}
-	return &Clerk{servers: servers, router: router}
+	return &Clerk{servers: servers, router: router, coordinator: NewTxCoordinator(router)}
 }
 
 // MakeShardedClerk 创建多 Group 分片 Clerk。
@@ -92,7 +93,17 @@ func MakeShardedClerk(cfg sharding.ShardingConfig) (*Clerk, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Clerk{router: router}, nil
+	return &Clerk{router: router, coordinator: NewTxCoordinator(router)}, nil
+}
+
+// Begin 开始一个分布式事务。
+func (ck *Clerk) Begin() *TxHandle {
+	return ck.coordinator.Begin()
+}
+
+// Rollback 放弃事务，释放所有 Group 上的锁。
+func (ck *Clerk) Rollback(h *TxHandle) {
+	h.Rollback()
 }
 
 // mapPBErr 将 gRPC 响应中的错误字符串转为 Err 类型。
@@ -110,6 +121,12 @@ func mapPBErr(errText string) Err {
 		return ErrMaybe
 	case string(ErrWrongGroup):
 		return ErrWrongGroup
+	case string(ErrTxConflict):
+		return ErrTxConflict
+	case string(ErrTxNotFound):
+		return ErrTxNotFound
+	case string(ErrTxTimeout):
+		return ErrTxTimeout
 	default:
 		if strings.Contains(strings.ToLower(errText), "unimplemented") {
 			return ErrWrongLeader

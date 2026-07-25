@@ -471,6 +471,170 @@ func (r *ShardRouter) ScanGroup(ctx context.Context, gid int, prefix string, lim
 	return nil, lastErr
 }
 
+// PrepareTxToGroup 将 PrepareTx RPC 路由到指定 Group。
+func (r *ShardRouter) PrepareTxToGroup(ctx context.Context, gid int, req *pb.PrepareTxRequest) (*pb.PrepareTxResponse, error) {
+	var lastErr error
+	for _, replica := range r.groupReplicaCandidates(gid) {
+		r.mu.RLock()
+		client := r.groupClients[gid][replica]
+		r.mu.RUnlock()
+		if client == nil {
+			continue
+		}
+
+		reqCtx, cancel := r.withRequestTimeout(ctx)
+		resp, rpcErr := client.PrepareTx(reqCtx, req)
+		cancel()
+
+		if rpcErr != nil {
+			r.invalidateLeader(gid, replica)
+			lastErr = rpcErr
+			continue
+		}
+		if resp == nil {
+			r.invalidateLeader(gid, replica)
+			lastErr = fmt.Errorf("empty PrepareTx response from %s", replica)
+			continue
+		}
+		if r.isWrongLeader(resp.GetError()) {
+			r.invalidateLeader(gid, replica)
+			lastErr = fmt.Errorf("group %d wrong leader via %s", gid, replica)
+			continue
+		}
+
+		r.setLeader(gid, replica)
+		return resp, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no available replica for group %d", gid)
+	}
+	return nil, lastErr
+}
+
+// CommitTxToGroup 将 CommitTx RPC 路由到指定 Group。
+func (r *ShardRouter) CommitTxToGroup(ctx context.Context, gid int, req *pb.CommitTxRequest) (*pb.CommitTxResponse, error) {
+	var lastErr error
+	for _, replica := range r.groupReplicaCandidates(gid) {
+		r.mu.RLock()
+		client := r.groupClients[gid][replica]
+		r.mu.RUnlock()
+		if client == nil {
+			continue
+		}
+
+		reqCtx, cancel := r.withRequestTimeout(ctx)
+		resp, rpcErr := client.CommitTx(reqCtx, req)
+		cancel()
+
+		if rpcErr != nil {
+			r.invalidateLeader(gid, replica)
+			lastErr = rpcErr
+			continue
+		}
+		if resp == nil {
+			r.invalidateLeader(gid, replica)
+			lastErr = fmt.Errorf("empty CommitTx response from %s", replica)
+			continue
+		}
+		if r.isWrongLeader(resp.GetError()) {
+			r.invalidateLeader(gid, replica)
+			lastErr = fmt.Errorf("group %d wrong leader via %s", gid, replica)
+			continue
+		}
+
+		r.setLeader(gid, replica)
+		return resp, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no available replica for group %d", gid)
+	}
+	return nil, lastErr
+}
+
+// AbortTxToGroup 将 AbortTx RPC 路由到指定 Group。
+func (r *ShardRouter) AbortTxToGroup(ctx context.Context, gid int, req *pb.AbortTxRequest) (*pb.AbortTxResponse, error) {
+	var lastErr error
+	for _, replica := range r.groupReplicaCandidates(gid) {
+		r.mu.RLock()
+		client := r.groupClients[gid][replica]
+		r.mu.RUnlock()
+		if client == nil {
+			continue
+		}
+
+		reqCtx, cancel := r.withRequestTimeout(ctx)
+		resp, rpcErr := client.AbortTx(reqCtx, req)
+		cancel()
+
+		if rpcErr != nil {
+			r.invalidateLeader(gid, replica)
+			lastErr = rpcErr
+			continue
+		}
+		if resp == nil {
+			r.invalidateLeader(gid, replica)
+			lastErr = fmt.Errorf("empty AbortTx response from %s", replica)
+			continue
+		}
+		if r.isWrongLeader(resp.GetError()) {
+			r.invalidateLeader(gid, replica)
+			lastErr = fmt.Errorf("group %d wrong leader via %s", gid, replica)
+			continue
+		}
+
+		r.setLeader(gid, replica)
+		return resp, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no available replica for group %d", gid)
+	}
+	return nil, lastErr
+}
+
+// ResolveTxStatusToGroup 将 ResolveTxStatus RPC 路由到指定 Group。
+func (r *ShardRouter) ResolveTxStatusToGroup(ctx context.Context, gid int, req *pb.ResolveTxStatusRequest) (*pb.ResolveTxStatusResponse, error) {
+	var lastErr error
+	for _, replica := range r.groupReplicaCandidates(gid) {
+		r.mu.RLock()
+		client := r.groupClients[gid][replica]
+		r.mu.RUnlock()
+		if client == nil {
+			continue
+		}
+
+		reqCtx, cancel := r.withRequestTimeout(ctx)
+		resp, rpcErr := client.ResolveTxStatus(reqCtx, req)
+		cancel()
+
+		if rpcErr != nil {
+			r.invalidateLeader(gid, replica)
+			lastErr = rpcErr
+			continue
+		}
+		if resp == nil {
+			r.invalidateLeader(gid, replica)
+			lastErr = fmt.Errorf("empty ResolveTxStatus response from %s", replica)
+			continue
+		}
+		if r.isWrongLeader(resp.GetError()) {
+			r.invalidateLeader(gid, replica)
+			lastErr = fmt.Errorf("group %d wrong leader via %s", gid, replica)
+			continue
+		}
+
+		r.setLeader(gid, replica)
+		return resp, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no available replica for group %d", gid)
+	}
+	return nil, lastErr
+}
+
 // GetRoute 路由 Get 请求。
 func (r *ShardRouter) GetRoute(ctx context.Context, key string) (*pb.GetResponse, error) {
 	gid, err := r.groupForKey(key)

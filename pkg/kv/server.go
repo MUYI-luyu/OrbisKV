@@ -60,6 +60,7 @@ type KVServer struct {
 	grpcLn           net.Listener
 	grpcSrv          *grpc.Server
 	shardMgr         *shardStateManager // shard 状态机（迁移时控制双写/拒绝）
+	txMgr            *TxManager          // 2PC 事务管理器
 }
 
 
@@ -81,7 +82,7 @@ type RuntimePerfStats struct {
 }
 
 func NewKVServer(me int, groupID int, address string, store *storage.Store) *KVServer {
-	return &KVServer{
+	kv := &KVServer{
 		me:               me,
 		groupID:          groupID,
 		address:          address,
@@ -92,6 +93,8 @@ func NewKVServer(me int, groupID int, address string, store *storage.Store) *KVS
 		ttlBatch:         128,
 		shardMgr:         newShardStateManager(groupID, 1024),
 	}
+	kv.txMgr = NewTxManager(kv)
+	return kv
 }
 
 // TopologyEpoch 返回本节点已知的拓扑版本号。
@@ -139,6 +142,14 @@ func (kv *KVServer) DoOp(req any) any {
 		return kv.doScan(reqPtr[ScanArgs](req))
 	case *ExpireArgs, ExpireArgs:
 		return kv.doExpire(reqPtr[ExpireArgs](req))
+	case *PrepareTxArgs, PrepareTxArgs:
+		return kv.txMgr.Prepare(reqPtr[PrepareTxArgs](req))
+	case *CommitTxArgs, CommitTxArgs:
+		return kv.txMgr.Commit(reqPtr[CommitTxArgs](req))
+	case *AbortTxArgs, AbortTxArgs:
+		return kv.txMgr.Abort(reqPtr[AbortTxArgs](req))
+	case *ResolveTxStatusArgs, ResolveTxStatusArgs:
+		return kv.txMgr.ResolveTxStatus(reqPtr[ResolveTxStatusArgs](req))
 	default:
 		log.Printf("[KVServer-%d] Unknown request type: %T", kv.me, req)
 		return GetReply{Err: ErrWrongLeader}
@@ -358,6 +369,15 @@ func (kv *KVServer) doExpire(args *ExpireArgs) ExpireReply {
 	expired := make([]string, 0, len(args.Keys))
 	expiredOldValues := make(map[string]string, len(args.Keys))
 	for _, key := range args.Keys {
+		// 跳过被事务锁定的 key（事务可能仍在进行中）
+		if kv.txMgr != nil {
+			kv.txMgr.mu.RLock()
+			_, locked := kv.txMgr.lockTable[key]
+			kv.txMgr.mu.RUnlock()
+			if locked {
+				continue
+			}
+		}
 		oldValue, _, expires, exists, err := kv.store.Get(key)
 		if err != nil {
 			continue
@@ -397,6 +417,12 @@ func (kv *KVServer) Restore(data []byte) {
 	}
 	if err := kv.store.LoadSnapshot(data); err != nil {
 		log.Printf("[KVServer-%d] Restore snapshot error: %v", kv.me, err)
+	}
+	// 快照恢复后重建 lock table（_tx:prepare:* 记录已随 store 恢复）
+	if kv.txMgr != nil {
+		if err := kv.txMgr.RebuildLockTable(); err != nil {
+			log.Printf("[KVServer-%d] Restore: RebuildLockTable error: %v", kv.me, err)
+		}
 	}
 }
 

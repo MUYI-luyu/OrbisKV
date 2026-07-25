@@ -21,6 +21,9 @@ const (
 	ErrVersion     Err = "ErrVersion"
 	ErrMaybe       Err = "ErrMaybe"
 	ErrWrongGroup  Err = "ErrWrongGroup"  // shard 不属于本 group
+	ErrTxConflict  Err = "ErrTxConflict"  // prepare 时版本冲突或 lock 已被持有
+	ErrTxNotFound  Err = "ErrTxNotFound"  // txID 不存在
+	ErrTxTimeout   Err = "ErrTxTimeout"   // prepare 超时
 )
 
 // GetArgs 是 Get 操作的参数。
@@ -125,4 +128,77 @@ type RSMInterface interface {
 	Close()
 	ApplyLoopPerfStatsSnapshot() ApplyLoopPerfStats
 	RaftPerfStatsSnapshot() raft.RaftPerfStats
+}
+
+// ============ 2PC 事务类型 ============
+
+// ReadKey 描述事务中读取的一个 key，带预期版本用于冲突校验。
+type ReadKey struct {
+	Key             string
+	ExpectedVersion Tversion
+}
+
+// WriteKey 描述事务中要写入的一个 key。
+type WriteKey struct {
+	Key   string
+	Value string
+	// Version 是预期的当前版本（CAS）。0 表示 "key 必须不存在"。
+	Version Tversion
+}
+
+// PrepareTxArgs 是 Phase-1 请求：校验读集 + 获取写锁。
+type PrepareTxArgs struct {
+	TxID      string
+	ReadKeys  []ReadKey
+	WriteKeys []WriteKey
+	TimeoutMs int64
+}
+
+// PrepareTxReply 是 Phase-1 响应。
+type PrepareTxReply struct {
+	Err Err
+}
+
+// CommitTxArgs 是 Phase-2 请求：原子应用写操作。
+type CommitTxArgs struct {
+	TxID      string
+	WriteKeys []WriteKey
+}
+
+// CommitTxReply 是 Phase-2 响应。
+type CommitTxReply struct {
+	Err Err
+}
+
+// AbortTxArgs 释放已 prepare 事务持有的锁。
+type AbortTxArgs struct {
+	TxID string
+}
+
+// AbortTxReply 是 abort 响应。
+type AbortTxReply struct {
+	Err Err
+}
+
+// TxStatus 枚举事务可能的状态。
+type TxStatus int
+
+const (
+	TxStatusNotFound  TxStatus = iota
+	TxStatusPrepared
+	TxStatusCommitted
+	TxStatusAborted
+)
+
+// ResolveTxStatusArgs 查询事务状态（用于锁恢复）。
+type ResolveTxStatusArgs struct {
+	TxID string
+}
+
+// ResolveTxStatusReply 返回事务状态，如果已 prepare 则返回其 write keys。
+type ResolveTxStatusReply struct {
+	Status     TxStatus
+	PreparedAt int64
+	WriteKeys  []WriteKey
+	Err        Err
 }

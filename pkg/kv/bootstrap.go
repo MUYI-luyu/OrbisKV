@@ -36,6 +36,10 @@ func StartKVServer(servers []string, gid int, me int, persister raft.Persister, 
 	gob.Register(DeleteArgs{})
 	gob.Register(ScanArgs{})
 	gob.Register(ExpireArgs{})
+	gob.Register(PrepareTxArgs{})
+	gob.Register(CommitTxArgs{})
+	gob.Register(AbortTxArgs{})
+	gob.Register(ResolveTxStatusArgs{})
 
 	storePath := filepath.Join(runtimeDataRoot(), "badger-"+address)
 	store, err := storage.NewStore(storePath)
@@ -47,6 +51,10 @@ func StartKVServer(servers []string, gid int, me int, persister raft.Persister, 
 	rsm := MakeRSM(servers, me, persister, maxraftstate, kvServer)
 	kvServer.SetRSM(rsm)
 	rsm.RegisterOpCompleteListener(kvServer)
+
+	if err := kvServer.txMgr.RebuildLockTable(); err != nil {
+		log.Printf("[bootstrap] RebuildLockTable error: %v", err)
+	}
 
 	rpcs := rpc.NewServer()
 	if err := rpcs.RegisterName("Raft", rsm.rf); err != nil {

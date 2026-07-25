@@ -19,6 +19,20 @@ type kvEntry struct {
 	Expires int64  `json:"expires"`
 }
 
+// Tx 记录 key 前缀 — 将事务元数据与用户数据隔离开。
+const (
+	txKeyPrefix = "_tx:"
+)
+
+// WriteBatchOp 描述单次 WriteBatchWithCAS 中的一个原子写操作。
+type WriteBatchOp struct {
+	Key             string
+	Value           string
+	ExpectedVersion uint64
+	Expires         int64
+	IsDelete        bool
+}
+
 // Store 是基于BadgerDB的持久化存储实现
 type Store struct {
 	db     *badger.DB
@@ -225,6 +239,161 @@ func (s *Store) PutCASWithTTL(key, value string, expectedVersion uint64, expires
 		s.trackExpiry(key, expires)
 	}
 	return oldValue, status, err
+}
+
+// writeBatchWithCASInTxn 在给定的 BadgerDB 事务中执行 CAS 批量写操作。
+// 每条 op 在 txn 内先 Get 当前版本，比对 ExpectedVersion，再 Set。
+// 任何一个冲突就返回 error 导致整个事务回滚。
+func (s *Store) writeBatchWithCASInTxn(txn *badger.Txn, ops []WriteBatchOp) error {
+	for _, op := range ops {
+		if op.IsDelete {
+			item, err := txn.Get([]byte(op.Key))
+			if err == badger.ErrKeyNotFound {
+				if op.ExpectedVersion != 0 {
+					return fmt.Errorf("WriteBatchWithCAS: key %q not found, expected version %d", op.Key, op.ExpectedVersion)
+				}
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			raw, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+			var cur kvEntry
+			if err := json.Unmarshal(raw, &cur); err != nil {
+				return err
+			}
+			if cur.Version != op.ExpectedVersion {
+				return fmt.Errorf("WriteBatchWithCAS: version mismatch for key %q, expected %d, got %d", op.Key, op.ExpectedVersion, cur.Version)
+			}
+			if err := txn.Delete([]byte(op.Key)); err != nil {
+				return err
+			}
+		} else {
+			item, getErr := txn.Get([]byte(op.Key))
+			if getErr == badger.ErrKeyNotFound {
+				if op.ExpectedVersion != 0 {
+					return fmt.Errorf("WriteBatchWithCAS: key %q not found, expected version %d", op.Key, op.ExpectedVersion)
+				}
+				entry := kvEntry{Value: op.Value, Version: 1, Expires: op.Expires}
+				data, marshalErr := json.Marshal(entry)
+				if marshalErr != nil {
+					return fmt.Errorf("WriteBatchWithCAS: marshal failed: %w", marshalErr)
+				}
+				if err := txn.Set([]byte(op.Key), data); err != nil {
+					return err
+				}
+				continue
+			}
+			if getErr != nil {
+				return getErr
+			}
+			raw, copyErr := item.ValueCopy(nil)
+			if copyErr != nil {
+				return copyErr
+			}
+			var cur kvEntry
+			if unmarshalErr := json.Unmarshal(raw, &cur); unmarshalErr != nil {
+				return unmarshalErr
+			}
+			if cur.Version != op.ExpectedVersion {
+				return fmt.Errorf("WriteBatchWithCAS: version mismatch for key %q, expected %d, got %d", op.Key, op.ExpectedVersion, cur.Version)
+			}
+			entry := kvEntry{Value: op.Value, Version: cur.Version + 1, Expires: op.Expires}
+			data, marshalErr := json.Marshal(entry)
+			if marshalErr != nil {
+				return fmt.Errorf("WriteBatchWithCAS: marshal failed: %w", marshalErr)
+			}
+			if err := txn.Set([]byte(op.Key), data); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// WriteBatchWithCAS 在单个 BadgerDB 事务中原子执行多条 CAS 写操作。
+// 每条 op 在 txn 内先 Get 当前版本，比对 ExpectedVersion，再 Set。
+// 任何一个冲突就整体回滚。
+func (s *Store) WriteBatchWithCAS(ops []WriteBatchOp) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		return s.writeBatchWithCASInTxn(txn, ops)
+	})
+}
+
+// WriteBatchWithCASAndRecord 在单个 BadgerDB 事务中原子执行 CAS 批量写入
+// 并同时持久化一条 tx 记录（如 commit/abort 标记）。两者要么一起落盘，
+// 要么一起回滚，消除崩溃窗口——防止用户数据已写入但 commit 记录丢失
+// 导致 Raft 重放时版本冲突、事务永久卡死。
+func (s *Store) WriteBatchWithCASAndRecord(ops []WriteBatchOp, recordKey string, recordData []byte) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		if err := s.writeBatchWithCASInTxn(txn, ops); err != nil {
+			return err
+		}
+		return txn.Set([]byte(txKeyPrefix+recordKey), recordData)
+	})
+}
+
+// PutTxRecord 在 _tx: 前缀的 key 下写入原始字节。
+func (s *Store) PutTxRecord(txKey string, data []byte) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		return txn.Set([]byte(txKeyPrefix+txKey), data)
+	})
+}
+
+// GetTxRecord 从 _tx: 前缀的 key 读取原始字节。
+func (s *Store) GetTxRecord(txKey string) ([]byte, bool, error) {
+	var val []byte
+	found := false
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(txKeyPrefix + txKey))
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		val, err = item.ValueCopy(nil)
+		if err != nil {
+			return err
+		}
+		found = true
+		return nil
+	})
+	return val, found, err
+}
+
+// DeleteTxRecord 删除一个 _tx: 前缀的 key。
+func (s *Store) DeleteTxRecord(txKey string) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		return txn.Delete([]byte(txKeyPrefix + txKey))
+	})
+}
+
+// ScanTxRecordsByPrefix 扫描 _tx: 前缀且匹配给定子前缀的 key。
+func (s *Store) ScanTxRecordsByPrefix(subPrefix string) (map[string][]byte, error) {
+	result := make(map[string][]byte)
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		opts.Prefix = []byte(txKeyPrefix + subPrefix)
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := string(item.Key())
+			val, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+			result[key] = val
+		}
+		return nil
+	})
+	return result, err
 }
 
 // PeekExpiredKeys 从 TTL 堆中获取所有过期时间 <= cutoff 的键（最多 limit 个）。
