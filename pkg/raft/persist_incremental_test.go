@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestPersistV3RoundTrip(t *testing.T) {
+func TestPersistRoundTrip(t *testing.T) {
 	rf := &Raft{
 		CurrentTerm:       5,
 		VotedFor:          2,
@@ -25,9 +25,9 @@ func TestPersistV3RoundTrip(t *testing.T) {
 	}
 
 	var restored Raft
-	if !restored.readPersistV3(append([]byte(nil), data...)) {
-		t.Logf("encoded_len=%d magic=%#x logCount=%d", len(data), binary.LittleEndian.Uint32(data[persistV3OffMagic:persistV3OffMagic+4]), binary.LittleEndian.Uint64(data[persistV3OffLogCount:persistV3OffLogCount+8]))
-		t.Fatalf("readPersistV3 failed")
+	if !restored.readPersistBinary(append([]byte(nil), data...)) {
+		t.Logf("encoded_len=%d magic=%#x logCount=%d", len(data), binary.LittleEndian.Uint32(data[persistOffMagic:persistOffMagic+4]), binary.LittleEndian.Uint64(data[persistOffLogCount:persistOffLogCount+8]))
+		t.Fatalf("readPersist failed")
 	}
 
 	if restored.CurrentTerm != rf.CurrentTerm {
@@ -54,7 +54,7 @@ func TestPersistV3RoundTrip(t *testing.T) {
 	}
 }
 
-func TestPersistV3AppendKeepsEncodedPrefix(t *testing.T) {
+func TestPersistAppendKeepsEncodedPrefix(t *testing.T) {
 	rf := &Raft{
 		CurrentTerm:       2,
 		VotedFor:          1,
@@ -71,9 +71,9 @@ func TestPersistV3AppendKeepsEncodedPrefix(t *testing.T) {
 		t.Fatalf("first incremental encode failed")
 	}
 
-	prefix := append([]byte(nil), data1[persistV3HeaderSize:]...)
+	prefix := append([]byte(nil), data1[persistHeaderSize:]...)
 	appendFrom := len(rf.log)
-	rf.markPersistV3DirtyFromLocked(appendFrom)
+	rf.markPersistDirtyFromLocked(appendFrom)
 	rf.log = append(rf.log, LogEntry{Term: 2, Command: "second"})
 
 	data2, ok := rf.encodePersistentStateIncrementalLocked()
@@ -85,12 +85,12 @@ func TestPersistV3AppendKeepsEncodedPrefix(t *testing.T) {
 		t.Fatalf("encoded size did not grow after append: before=%d after=%d", len(data1), len(data2))
 	}
 
-	if !bytes.Equal(prefix, data2[persistV3HeaderSize:persistV3HeaderSize+len(prefix)]) {
+	if !bytes.Equal(prefix, data2[persistHeaderSize:persistHeaderSize+len(prefix)]) {
 		t.Fatalf("existing encoded log prefix changed after pure append")
 	}
 }
 
-func TestPersistV3TruncateThenAppend(t *testing.T) {
+func TestPersistTruncateThenAppend(t *testing.T) {
 	rf := &Raft{
 		CurrentTerm:       3,
 		VotedFor:          1,
@@ -108,7 +108,7 @@ func TestPersistV3TruncateThenAppend(t *testing.T) {
 		t.Fatalf("initial incremental encode failed")
 	}
 
-	rf.markPersistV3DirtyFromLocked(2)
+	rf.markPersistDirtyFromLocked(2)
 	rf.log = rf.log[:2]
 	rf.log = append(rf.log, LogEntry{Term: 9, Command: "x"})
 
@@ -118,9 +118,9 @@ func TestPersistV3TruncateThenAppend(t *testing.T) {
 	}
 
 	var restored Raft
-	if !restored.readPersistV3(append([]byte(nil), data2...)) {
-		t.Logf("encoded_len=%d magic=%#x logCount=%d", len(data2), binary.LittleEndian.Uint32(data2[persistV3OffMagic:persistV3OffMagic+4]), binary.LittleEndian.Uint64(data2[persistV3OffLogCount:persistV3OffLogCount+8]))
-		t.Fatalf("readPersistV3 after truncate+append failed")
+	if !restored.readPersistBinary(append([]byte(nil), data2...)) {
+		t.Logf("encoded_len=%d magic=%#x logCount=%d", len(data2), binary.LittleEndian.Uint32(data2[persistOffMagic:persistOffMagic+4]), binary.LittleEndian.Uint64(data2[persistOffLogCount:persistOffLogCount+8]))
+		t.Fatalf("readPersist after truncate+append failed")
 	}
 
 	if len(restored.log) != 3 {

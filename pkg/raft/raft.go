@@ -62,24 +62,24 @@ type RaftPerfStats struct {
 }
 
 const (
-	persistFormatV3Magic uint32 = 0x4b565233 // "KVR3"
-	persistV3HeaderSize         = 44
+	persistFormatMagic uint32 = 0x4b565233 // "KVR3"
+	persistHeaderSize         = 44
 
-	persistV3OffMagic            = 0
-	persistV3OffCurrentTerm      = 4
-	persistV3OffVotedFor         = 12
-	persistV3OffLastIncludedIdx  = 20
-	persistV3OffLastIncludedTerm = 28
-	persistV3OffLogCount         = 36
+	persistOffMagic            = 0
+	persistOffCurrentTerm      = 4
+	persistOffVotedFor         = 12
+	persistOffLastIncludedIdx  = 20
+	persistOffLastIncludedTerm = 28
+	persistOffLogCount         = 36
 
-	persistV3AppendPayloadMagic uint32 = 0x52504131 // "RPA1"
-	persistV3AppendPayloadSize         = 28
+	persistAppendPayloadMagic uint32 = 0x52504131 // "RPA1"
+	persistAppendPayloadSize         = 28
 
-	persistV3AppendOffMagic     = 0
-	persistV3AppendOffPrevLen   = 4
-	persistV3AppendOffNewLen    = 12
-	persistV3AppendOffHeaderLen = 20
-	persistV3AppendOffDeltaLen  = 24
+	persistAppendOffMagic     = 0
+	persistAppendOffPrevLen   = 4
+	persistAppendOffNewLen    = 12
+	persistAppendOffHeaderLen = 20
+	persistAppendOffDeltaLen  = 24
 )
 
 type persistedCommandEnvelope struct {
@@ -138,17 +138,17 @@ type Raft struct {
 	rpcMu      sync.Mutex
 	rpcClients map[string]*rpc.Client
 
-	// 增量持久化缓存（V3）：state = header + encoded log entries。
-	persistV3State     []byte
-	persistV3EntryEnd  []int
-	persistV3LogCount  int
-	persistV3DirtyFrom int
-	persistV3Ready     bool
+	// 增量持久化缓存：state = header + encoded log entries。
+	persistState     []byte
+	persistEntryEnd  []int
+	persistLogCount  int
+	persistDirtyFrom int
+	persistReady     bool
 
-	persistV3PersistedLen      int
-	persistV3PersistedLogCount int
-	persistV3QueuedLen         int
-	persistV3QueuedLogCount    int
+	persistPersistedLen      int
+	persistPersistedLogCount int
+	persistQueuedLen         int
+	persistQueuedLogCount    int
 
 	muWaitNanos      int64
 	muWaitCount      int64
@@ -373,22 +373,22 @@ func (rf *Raft) getTerm(index int) int {
 	return rf.log[index-rf.lastIncludedIndex].Term
 }
 
-func makePersistV3Header() []byte {
-	buf := make([]byte, persistV3HeaderSize)
-	binary.LittleEndian.PutUint32(buf[persistV3OffMagic:persistV3OffMagic+4], persistFormatV3Magic)
+func makePersistHeader() []byte {
+	buf := make([]byte, persistHeaderSize)
+	binary.LittleEndian.PutUint32(buf[persistOffMagic:persistOffMagic+4], persistFormatMagic)
 	return buf
 }
 
-func putPersistV3HeaderFields(buf []byte, currentTerm, votedFor, lastIncludedIndex, lastIncludedTerm, logCount int) bool {
-	if len(buf) < persistV3HeaderSize {
+func putPersistHeaderFields(buf []byte, currentTerm, votedFor, lastIncludedIndex, lastIncludedTerm, logCount int) bool {
+	if len(buf) < persistHeaderSize {
 		return false
 	}
-	binary.LittleEndian.PutUint32(buf[persistV3OffMagic:persistV3OffMagic+4], persistFormatV3Magic)
-	binary.LittleEndian.PutUint64(buf[persistV3OffCurrentTerm:persistV3OffCurrentTerm+8], uint64(int64(currentTerm)))
-	binary.LittleEndian.PutUint64(buf[persistV3OffVotedFor:persistV3OffVotedFor+8], uint64(int64(votedFor)))
-	binary.LittleEndian.PutUint64(buf[persistV3OffLastIncludedIdx:persistV3OffLastIncludedIdx+8], uint64(int64(lastIncludedIndex)))
-	binary.LittleEndian.PutUint64(buf[persistV3OffLastIncludedTerm:persistV3OffLastIncludedTerm+8], uint64(int64(lastIncludedTerm)))
-	binary.LittleEndian.PutUint64(buf[persistV3OffLogCount:persistV3OffLogCount+8], uint64(int64(logCount)))
+	binary.LittleEndian.PutUint32(buf[persistOffMagic:persistOffMagic+4], persistFormatMagic)
+	binary.LittleEndian.PutUint64(buf[persistOffCurrentTerm:persistOffCurrentTerm+8], uint64(int64(currentTerm)))
+	binary.LittleEndian.PutUint64(buf[persistOffVotedFor:persistOffVotedFor+8], uint64(int64(votedFor)))
+	binary.LittleEndian.PutUint64(buf[persistOffLastIncludedIdx:persistOffLastIncludedIdx+8], uint64(int64(lastIncludedIndex)))
+	binary.LittleEndian.PutUint64(buf[persistOffLastIncludedTerm:persistOffLastIncludedTerm+8], uint64(int64(lastIncludedTerm)))
+	binary.LittleEndian.PutUint64(buf[persistOffLogCount:persistOffLogCount+8], uint64(int64(logCount)))
 	return true
 }
 
@@ -407,74 +407,74 @@ func readInt64LE(src []byte, offset *int) (int64, bool) {
 	return v, true
 }
 
-func (rf *Raft) initPersistV3CacheLocked() {
-	rf.persistV3State = makePersistV3Header()
-	rf.persistV3EntryEnd = rf.persistV3EntryEnd[:0]
-	rf.persistV3LogCount = 0
-	rf.persistV3DirtyFrom = 0
-	rf.persistV3Ready = true
+func (rf *Raft) initPersistCacheLocked() {
+	rf.persistState = makePersistHeader()
+	rf.persistEntryEnd = rf.persistEntryEnd[:0]
+	rf.persistLogCount = 0
+	rf.persistDirtyFrom = 0
+	rf.persistReady = true
 }
 
-func (rf *Raft) invalidatePersistV3CacheLocked() {
-	rf.persistV3State = nil
-	rf.persistV3EntryEnd = nil
-	rf.persistV3LogCount = 0
-	rf.persistV3DirtyFrom = 0
-	rf.persistV3Ready = false
-	rf.persistV3PersistedLen = 0
-	rf.persistV3PersistedLogCount = 0
-	rf.persistV3QueuedLen = 0
-	rf.persistV3QueuedLogCount = 0
+func (rf *Raft) invalidatePersistCacheLocked() {
+	rf.persistState = nil
+	rf.persistEntryEnd = nil
+	rf.persistLogCount = 0
+	rf.persistDirtyFrom = 0
+	rf.persistReady = false
+	rf.persistPersistedLen = 0
+	rf.persistPersistedLogCount = 0
+	rf.persistQueuedLen = 0
+	rf.persistQueuedLogCount = 0
 }
 
-func canUsePersistV3Append(state []byte, prevLen int) bool {
-	if prevLen < persistV3HeaderSize {
+func canUsePersistAppend(state []byte, prevLen int) bool {
+	if prevLen < persistHeaderSize {
 		return false
 	}
 	if len(state) < prevLen {
 		return false
 	}
-	return len(state) >= persistV3HeaderSize
+	return len(state) >= persistHeaderSize
 }
 
-func buildPersistV3AppendPayload(state []byte, prevLen int) ([]byte, bool) {
-	if !canUsePersistV3Append(state, prevLen) {
+func buildPersistAppendPayload(state []byte, prevLen int) ([]byte, bool) {
+	if !canUsePersistAppend(state, prevLen) {
 		return nil, false
 	}
 
 	delta := state[prevLen:]
 	deltaLen := len(delta)
-	payloadLen := persistV3AppendPayloadSize + persistV3HeaderSize + deltaLen
+	payloadLen := persistAppendPayloadSize + persistHeaderSize + deltaLen
 	payload := make([]byte, payloadLen)
 
-	binary.LittleEndian.PutUint32(payload[persistV3AppendOffMagic:persistV3AppendOffMagic+4], persistV3AppendPayloadMagic)
-	binary.LittleEndian.PutUint64(payload[persistV3AppendOffPrevLen:persistV3AppendOffPrevLen+8], uint64(prevLen))
-	binary.LittleEndian.PutUint64(payload[persistV3AppendOffNewLen:persistV3AppendOffNewLen+8], uint64(len(state)))
-	binary.LittleEndian.PutUint32(payload[persistV3AppendOffHeaderLen:persistV3AppendOffHeaderLen+4], uint32(persistV3HeaderSize))
-	binary.LittleEndian.PutUint32(payload[persistV3AppendOffDeltaLen:persistV3AppendOffDeltaLen+4], uint32(deltaLen))
+	binary.LittleEndian.PutUint32(payload[persistAppendOffMagic:persistAppendOffMagic+4], persistAppendPayloadMagic)
+	binary.LittleEndian.PutUint64(payload[persistAppendOffPrevLen:persistAppendOffPrevLen+8], uint64(prevLen))
+	binary.LittleEndian.PutUint64(payload[persistAppendOffNewLen:persistAppendOffNewLen+8], uint64(len(state)))
+	binary.LittleEndian.PutUint32(payload[persistAppendOffHeaderLen:persistAppendOffHeaderLen+4], uint32(persistHeaderSize))
+	binary.LittleEndian.PutUint32(payload[persistAppendOffDeltaLen:persistAppendOffDeltaLen+4], uint32(deltaLen))
 
-	copy(payload[persistV3AppendPayloadSize:persistV3AppendPayloadSize+persistV3HeaderSize], state[:persistV3HeaderSize])
-	copy(payload[persistV3AppendPayloadSize+persistV3HeaderSize:], delta)
+	copy(payload[persistAppendPayloadSize:persistAppendPayloadSize+persistHeaderSize], state[:persistHeaderSize])
+	copy(payload[persistAppendPayloadSize+persistHeaderSize:], delta)
 	return payload, true
 }
 
-func (rf *Raft) canPersistV3AppendLocked(snapshot []byte, state []byte, dirtyFromBefore int) bool {
+func (rf *Raft) canPersistAppendLocked(snapshot []byte, state []byte, dirtyFromBefore int) bool {
 	if snapshot != nil {
 		return false
 	}
-	if !rf.persistV3Ready {
+	if !rf.persistReady {
 		return false
 	}
-	if rf.persistV3QueuedLogCount > len(rf.log) {
+	if rf.persistQueuedLogCount > len(rf.log) {
 		return false
 	}
-	if dirtyFromBefore < rf.persistV3QueuedLogCount {
+	if dirtyFromBefore < rf.persistQueuedLogCount {
 		return false
 	}
-	return canUsePersistV3Append(state, rf.persistV3QueuedLen)
+	return canUsePersistAppend(state, rf.persistQueuedLen)
 }
 
-func (rf *Raft) markPersistV3PersistedLocked(stateLen int, logCount int) {
+func (rf *Raft) markPersistPersistedLocked(stateLen int, logCount int) {
 	if stateLen < 0 {
 		stateLen = 0
 	}
@@ -482,27 +482,27 @@ func (rf *Raft) markPersistV3PersistedLocked(stateLen int, logCount int) {
 		logCount = 0
 	}
 	// 使用 max 语义防止异步持久化回调乱序到达时覆盖较新的结果
-	if stateLen > rf.persistV3PersistedLen {
-		rf.persistV3PersistedLen = stateLen
+	if stateLen > rf.persistPersistedLen {
+		rf.persistPersistedLen = stateLen
 	}
-	if logCount > rf.persistV3PersistedLogCount {
-		rf.persistV3PersistedLogCount = logCount
+	if logCount > rf.persistPersistedLogCount {
+		rf.persistPersistedLogCount = logCount
 	}
 }
 
-func (rf *Raft) markPersistV3QueuedLocked(stateLen int, logCount int) {
+func (rf *Raft) markPersistQueuedLocked(stateLen int, logCount int) {
 	if stateLen < 0 {
 		stateLen = 0
 	}
 	if logCount < 0 {
 		logCount = 0
 	}
-	rf.persistV3QueuedLen = stateLen
-	rf.persistV3QueuedLogCount = logCount
+	rf.persistQueuedLen = stateLen
+	rf.persistQueuedLogCount = logCount
 }
 
-func (rf *Raft) markPersistV3DirtyFromLocked(pos int) {
-	if !rf.persistV3Ready {
+func (rf *Raft) markPersistDirtyFromLocked(pos int) {
+	if !rf.persistReady {
 		return
 	}
 	if pos < 0 {
@@ -511,82 +511,82 @@ func (rf *Raft) markPersistV3DirtyFromLocked(pos int) {
 	if pos > len(rf.log) {
 		pos = len(rf.log)
 	}
-	if rf.persistV3DirtyFrom > pos {
-		rf.persistV3DirtyFrom = pos
+	if rf.persistDirtyFrom > pos {
+		rf.persistDirtyFrom = pos
 	}
 }
 
-func (rf *Raft) truncatePersistV3ToLocked(keep int) bool {
-	if !rf.persistV3Ready {
+func (rf *Raft) truncatePersistToLocked(keep int) bool {
+	if !rf.persistReady {
 		return false
 	}
 	if keep < 0 {
 		keep = 0
 	}
 	if keep == 0 {
-		rf.persistV3State = rf.persistV3State[:persistV3HeaderSize]
-		rf.persistV3EntryEnd = rf.persistV3EntryEnd[:0]
-		rf.persistV3LogCount = 0
+		rf.persistState = rf.persistState[:persistHeaderSize]
+		rf.persistEntryEnd = rf.persistEntryEnd[:0]
+		rf.persistLogCount = 0
 		return true
 	}
-	if keep > len(rf.persistV3EntryEnd) {
+	if keep > len(rf.persistEntryEnd) {
 		return false
 	}
-	end := rf.persistV3EntryEnd[keep-1]
-	if end < persistV3HeaderSize || end > len(rf.persistV3State) {
+	end := rf.persistEntryEnd[keep-1]
+	if end < persistHeaderSize || end > len(rf.persistState) {
 		return false
 	}
-	rf.persistV3State = rf.persistV3State[:end]
-	rf.persistV3EntryEnd = rf.persistV3EntryEnd[:keep]
-	rf.persistV3LogCount = keep
+	rf.persistState = rf.persistState[:end]
+	rf.persistEntryEnd = rf.persistEntryEnd[:keep]
+	rf.persistLogCount = keep
 	return true
 }
 
-func (rf *Raft) appendPersistV3EntryLocked(entry *LogEntry) bool {
+func (rf *Raft) appendPersistEntryLocked(entry *LogEntry) bool {
 	if entry == nil {
 		return false
 	}
 	if !ensureEntryCommandEncoded(entry) {
 		return false
 	}
-	rf.persistV3State = appendInt64LE(rf.persistV3State, int64(entry.Term))
-	rf.persistV3State = appendInt64LE(rf.persistV3State, int64(len(entry.commandBytes)))
-	rf.persistV3State = append(rf.persistV3State, entry.commandBytes...)
-	rf.persistV3EntryEnd = append(rf.persistV3EntryEnd, len(rf.persistV3State))
-	rf.persistV3LogCount++
+	rf.persistState = appendInt64LE(rf.persistState, int64(entry.Term))
+	rf.persistState = appendInt64LE(rf.persistState, int64(len(entry.commandBytes)))
+	rf.persistState = append(rf.persistState, entry.commandBytes...)
+	rf.persistEntryEnd = append(rf.persistEntryEnd, len(rf.persistState))
+	rf.persistLogCount++
 	return true
 }
 
 func (rf *Raft) encodePersistentStateIncrementalLocked() ([]byte, bool) {
-	if !rf.persistV3Ready {
-		rf.initPersistV3CacheLocked()
+	if !rf.persistReady {
+		rf.initPersistCacheLocked()
 	}
 
-	if rf.persistV3DirtyFrom > len(rf.log) {
-		rf.persistV3DirtyFrom = len(rf.log)
+	if rf.persistDirtyFrom > len(rf.log) {
+		rf.persistDirtyFrom = len(rf.log)
 	}
 
-	if rf.persistV3LogCount > len(rf.log) {
-		if !rf.truncatePersistV3ToLocked(len(rf.log)) {
-			rf.initPersistV3CacheLocked()
+	if rf.persistLogCount > len(rf.log) {
+		if !rf.truncatePersistToLocked(len(rf.log)) {
+			rf.initPersistCacheLocked()
 		}
 	}
 
-	if rf.persistV3DirtyFrom < rf.persistV3LogCount {
-		if !rf.truncatePersistV3ToLocked(rf.persistV3DirtyFrom) {
-			rf.initPersistV3CacheLocked()
+	if rf.persistDirtyFrom < rf.persistLogCount {
+		if !rf.truncatePersistToLocked(rf.persistDirtyFrom) {
+			rf.initPersistCacheLocked()
 		}
 	}
 
-	for rf.persistV3LogCount < len(rf.log) {
-		idx := rf.persistV3LogCount
-		if !rf.appendPersistV3EntryLocked(&rf.log[idx]) {
+	for rf.persistLogCount < len(rf.log) {
+		idx := rf.persistLogCount
+		if !rf.appendPersistEntryLocked(&rf.log[idx]) {
 			return nil, false
 		}
 	}
 
-	if !putPersistV3HeaderFields(
-		rf.persistV3State,
+	if !putPersistHeaderFields(
+		rf.persistState,
 		rf.CurrentTerm,
 		rf.VotedFor,
 		rf.lastIncludedIndex,
@@ -596,26 +596,26 @@ func (rf *Raft) encodePersistentStateIncrementalLocked() ([]byte, bool) {
 		return nil, false
 	}
 
-	rf.persistV3DirtyFrom = len(rf.log)
-	return rf.persistV3State, true
+	rf.persistDirtyFrom = len(rf.log)
+	return rf.persistState, true
 }
 
 func (rf *Raft) enqueuePersistLocked(snapshot []byte) (<-chan error, int, int) {
-	dirtyFromBefore := rf.persistV3DirtyFrom
+	dirtyFromBefore := rf.persistDirtyFrom
 	state, ok := rf.encodePersistentStateIncrementalLocked()
 	if !ok {
-		rf.invalidatePersistV3CacheLocked()
-		return immediatePersistError(errors.New("persist v3 encode failed")), -1, -1
+		rf.invalidatePersistCacheLocked()
+		return immediatePersistError(errors.New("persist encode failed")), -1, -1
 	}
 	logCount := len(rf.log)
 	stateLen := len(state)
-	if rf.canPersistV3AppendLocked(snapshot, state, dirtyFromBefore) {
-		if payload, payloadOK := buildPersistV3AppendPayload(state, rf.persistV3QueuedLen); payloadOK {
-			rf.markPersistV3QueuedLocked(stateLen, logCount)
+	if rf.canPersistAppendLocked(snapshot, state, dirtyFromBefore) {
+		if payload, payloadOK := buildPersistAppendPayload(state, rf.persistQueuedLen); payloadOK {
+			rf.markPersistQueuedLocked(stateLen, logCount)
 			return rf.persister.EnqueueAppendRaftState(payload), stateLen, logCount
 		}
 	}
-	rf.markPersistV3QueuedLocked(stateLen, logCount)
+	rf.markPersistQueuedLocked(stateLen, logCount)
 	return rf.persister.EnqueueSave(state, snapshot), stateLen, logCount
 }
 
@@ -623,11 +623,11 @@ func (rf *Raft) commitPersistResult(stateLen int, logCount int, err error) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if err != nil {
-		rf.invalidatePersistV3CacheLocked()
+		rf.invalidatePersistCacheLocked()
 		return
 	}
 	if stateLen >= 0 {
-		rf.markPersistV3PersistedLocked(stateLen, logCount)
+		rf.markPersistPersistedLocked(stateLen, logCount)
 	}
 }
 
@@ -641,43 +641,43 @@ func (rf *Raft) persist(snapshot []byte) {
 	done, stateLen, logCount := rf.enqueuePersistLocked(snapshot)
 	err := rf.waitPersistDone(done)
 	if err != nil {
-		rf.invalidatePersistV3CacheLocked()
+		rf.invalidatePersistCacheLocked()
 		return
 	}
 	if stateLen >= 0 {
-		rf.markPersistV3PersistedLocked(stateLen, logCount)
+		rf.markPersistPersistedLocked(stateLen, logCount)
 	}
 }
 
 func (rf *Raft) persistHardState() {
 	err := rf.waitPersistDone(rf.enqueuePersistHardStateLocked())
 	if err != nil {
-		rf.invalidatePersistV3CacheLocked()
+		rf.invalidatePersistCacheLocked()
 	}
 }
 
 // 恢复先前持久化的状态。
 func (rf *Raft) readPersist(data []byte) {
-	if rf.readPersistV3(data) {
+	if rf.readPersistBinary(data) {
 		return
 	}
-	rf.invalidatePersistV3CacheLocked()
+	rf.invalidatePersistCacheLocked()
 }
 
-func (rf *Raft) readPersistV3(data []byte) bool {
-	if data == nil || len(data) < persistV3HeaderSize {
+func (rf *Raft) readPersistBinary(data []byte) bool {
+	if data == nil || len(data) < persistHeaderSize {
 		return false
 	}
 
-	if binary.LittleEndian.Uint32(data[persistV3OffMagic:persistV3OffMagic+4]) != persistFormatV3Magic {
+	if binary.LittleEndian.Uint32(data[persistOffMagic:persistOffMagic+4]) != persistFormatMagic {
 		return false
 	}
 
-	currentTerm := int(int64(binary.LittleEndian.Uint64(data[persistV3OffCurrentTerm : persistV3OffCurrentTerm+8])))
-	votedFor := int(int64(binary.LittleEndian.Uint64(data[persistV3OffVotedFor : persistV3OffVotedFor+8])))
-	lastIncludedIndex := int(int64(binary.LittleEndian.Uint64(data[persistV3OffLastIncludedIdx : persistV3OffLastIncludedIdx+8])))
-	lastIncludedTerm := int(int64(binary.LittleEndian.Uint64(data[persistV3OffLastIncludedTerm : persistV3OffLastIncludedTerm+8])))
-	logCount64 := int64(binary.LittleEndian.Uint64(data[persistV3OffLogCount : persistV3OffLogCount+8]))
+	currentTerm := int(int64(binary.LittleEndian.Uint64(data[persistOffCurrentTerm : persistOffCurrentTerm+8])))
+	votedFor := int(int64(binary.LittleEndian.Uint64(data[persistOffVotedFor : persistOffVotedFor+8])))
+	lastIncludedIndex := int(int64(binary.LittleEndian.Uint64(data[persistOffLastIncludedIdx : persistOffLastIncludedIdx+8])))
+	lastIncludedTerm := int(int64(binary.LittleEndian.Uint64(data[persistOffLastIncludedTerm : persistOffLastIncludedTerm+8])))
+	logCount64 := int64(binary.LittleEndian.Uint64(data[persistOffLogCount : persistOffLogCount+8]))
 	if logCount64 < 0 {
 		return false
 	}
@@ -686,7 +686,7 @@ func (rf *Raft) readPersistV3(data []byte) bool {
 	decodedLog := make([]LogEntry, 0, logCount)
 	entryEnds := make([]int, 0, logCount)
 
-	offset := persistV3HeaderSize
+	offset := persistHeaderSize
 	for i := 0; i < logCount; i++ {
 		term64, ok := readInt64LE(data, &offset)
 		if !ok {
@@ -718,17 +718,17 @@ func (rf *Raft) readPersistV3(data []byte) bool {
 
 	if len(decodedLog) == 0 {
 		decodedLog = []LogEntry{{Term: lastIncludedTerm}}
-		rf.invalidatePersistV3CacheLocked()
+		rf.invalidatePersistCacheLocked()
 	} else {
-		rf.persistV3State = append([]byte(nil), data...)
-		rf.persistV3EntryEnd = append([]int(nil), entryEnds...)
-		rf.persistV3LogCount = len(decodedLog)
-		rf.persistV3DirtyFrom = len(decodedLog)
-		rf.persistV3Ready = true
-		rf.persistV3PersistedLen = len(data)
-		rf.persistV3PersistedLogCount = len(decodedLog)
-		rf.persistV3QueuedLen = len(data)
-		rf.persistV3QueuedLogCount = len(decodedLog)
+		rf.persistState = append([]byte(nil), data...)
+		rf.persistEntryEnd = append([]int(nil), entryEnds...)
+		rf.persistLogCount = len(decodedLog)
+		rf.persistDirtyFrom = len(decodedLog)
+		rf.persistReady = true
+		rf.persistPersistedLen = len(data)
+		rf.persistPersistedLogCount = len(decodedLog)
+		rf.persistQueuedLen = len(data)
+		rf.persistQueuedLogCount = len(decodedLog)
 	}
 
 	rf.CurrentTerm = currentTerm
@@ -850,7 +850,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 
 	rf.log = newLogs
-	rf.markPersistV3DirtyFromLocked(0)
+	rf.markPersistDirtyFromLocked(0)
 
 	// 5. 更新 snapshot 元数据
 	rf.lastIncludedIndex = index
@@ -1055,7 +1055,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				cut = 1
 			}
 			if cut < len(rf.log) {
-				rf.markPersistV3DirtyFromLocked(cut)
+				rf.markPersistDirtyFromLocked(cut)
 				rf.log = rf.log[:cut]
 				persistNeeded = true
 			}
@@ -1067,7 +1067,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 注意：只追加 follower 没有的部分
 	if i < len(args.Entries) {
 		appendFrom := len(rf.log)
-		rf.markPersistV3DirtyFromLocked(appendFrom)
+		rf.markPersistDirtyFromLocked(appendFrom)
 		newEntries := make([]LogEntry, len(args.Entries)-i)
 		for j := i; j < len(args.Entries); j++ {
 			entry := args.Entries[j]
@@ -1136,7 +1136,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    term,
 		Command: command,
 	}
-	rf.markPersistV3DirtyFromLocked(len(rf.log))
+	rf.markPersistDirtyFromLocked(len(rf.log))
 	_ = ensureEntryCommandEncoded(&entry)
 	rf.log = append(rf.log, entry)
 
@@ -1244,7 +1244,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		// 快照覆盖的日志不存在或不一致，直接用快照
 		rf.log = []LogEntry{{Term: args.LastIncludedTerm}}
 	}
-	rf.markPersistV3DirtyFromLocked(0)
+	rf.markPersistDirtyFromLocked(0)
 	// 更新快照元数据
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm

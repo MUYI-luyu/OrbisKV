@@ -85,7 +85,7 @@ type FilePersister struct {
 	batchSize   int                     // 批处理触发阈值，定义了单次异步刷盘前最多积压的任务数量
 	reqCh       chan saveRequest        // 全量保存（RaftState + Snapshot）的任务分发管道
 	hardReqCh   chan hardStateRequest   // 高频硬状态更新的任务分发管道
-	appendReqCh chan appendStateRequest // V3 增量日志追加（Append）的任务分发管道
+	appendReqCh chan appendStateRequest // 增量日志追加（Append）的任务分发管道
 	stopCh      chan struct{}           // 停止信号，用于通知后台 Worker 协程停止接收新任务并准备退出
 	workerDone  chan struct{}           // Worker 退出确认信号，确保所有积压任务已完成 Flush 落盘
 	closed      bool                    // 标识当前持久化器是否已关闭，防止关闭后继续写入
@@ -99,7 +99,7 @@ type FilePersister struct {
 	saveBatchItems int64 // 累计处理的全量保存请求总数，与 count 相除可得平均批大小
 
 	appendBatchCount int64 // 累计执行增量追加的批次总数
-	appendBatchItems int64 // 累计处理的增量追加请求总数（体现 V3 的吞吐贡献）
+	appendBatchItems int64 // 累计处理的增量追加请求总数
 
 	hardBatchCount int64 // 累计执行硬状态更新的批次总数
 	hardBatchItems int64 // 累计处理的硬状态更新请求总数
