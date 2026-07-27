@@ -218,7 +218,7 @@ R_GRPC_SERVERS="$(runtime_value GRPC_SERVERS)"
 R_SHARDING_CONFIG="$(runtime_value SHARDING_CONFIG)"
 
 if [[ -z "${ARCH}" ]]; then
-  ARCH="${R_ARCH:-node-ring}"
+  ARCH="${R_ARCH:-group-ring}"
 fi
 if [[ -z "${R_BASE_PORT}" ]]; then
   R_BASE_PORT="${BASE_PORT}"

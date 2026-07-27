@@ -56,7 +56,7 @@ chmod +x ./scripts/*.sh
 
 if [[ "${WITH_TEST}" -eq 1 ]]; then
   echo "执行全量测试..."
-  ./scripts/test-all.sh
+  ./scripts/test_all.sh
 fi
 
 echo "环境初始化完成。"

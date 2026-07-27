@@ -333,6 +333,7 @@ EOF
 fi
 cat >> "${SHARDING_JSON}" <<EOF
   ],
+  "num_shards": 1024,
   "virtual_node_count": 150,
   "connect_timeout_ms": 2000,
   "request_timeout_ms": 1200,
