@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"time"
 
 	pb "kvraft/api/pb/kvraft/api/pb"
@@ -450,78 +451,66 @@ func (m *Migrator) MigrateShardOnline(ctx context.Context, shardID int, sourceGI
 }
 
 // bulkCopyShard 从源 group 扫描属于指定 shard 的 key，批量写入目标 group。
+// 注意：使用单次全量扫描（limit=0），避免 BadgerDB Prefix 模式下游标分页的语义错误。
+// 对于超大规模数据集，可扩展为 Seek-based 的增量扫描。
 func (m *Migrator) bulkCopyShard(ctx context.Context, shardID, sourceGID, targetGID int, prefix string) error {
-	const batchSize = 50
-	var cursor string
 	totalCopied := 0
 	numShards := m.source.TopologyNumShards()
 
-	for {
-		items, err := m.source.ScanGroup(ctx, sourceGID, prefix+cursor, int32(batchSize))
-		if err != nil {
-			return fmt.Errorf("scan source failed: %w", err)
-		}
-		if len(items) == 0 {
-			break
-		}
+	items, err := m.source.ScanGroup(ctx, sourceGID, "", 0)
+	if err != nil {
+		return fmt.Errorf("scan source failed: %w", err)
+	}
 
-		for _, item := range items {
-			if item == nil {
-				continue
-			}
-			// 只迁移属于目标 shard 的 key
-			if shardKey(item.GetKey(), numShards) != shardID {
-				continue
-			}
-			if _, err := m.target.PutToGroup(ctx, targetGID, item.GetKey(), item.GetValue(), item.GetVersion()); err != nil {
-				return fmt.Errorf("put to target failed key=%s: %w", item.GetKey(), err)
-			}
-			totalCopied++
+	for _, item := range items {
+		if item == nil {
+			continue
 		}
-
-		// 使用最后一个 key 作为游标继续扫描
-		lastKey := items[len(items)-1].GetKey()
-		if lastKey <= cursor {
-			break
+		key := item.GetKey()
+		// 只迁移属于目标 shard 的 key
+		if shardKey(key, numShards) != shardID {
+			continue
 		}
-		cursor = lastKey
+		// 可选 prefix 过滤
+		if prefix != "" && !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if _, err := m.target.PutToGroup(ctx, targetGID, key, item.GetValue(), item.GetVersion()); err != nil {
+			return fmt.Errorf("put to target failed key=%s: %w", key, err)
+		}
+		totalCopied++
 	}
 	log.Printf("[migrate] bulk copied %d keys for shard %d", totalCopied, shardID)
 	return nil
 }
 
 // cleanShardData 清理源 group 中属于指定 shard 的数据。
+// 使用单次全量扫描（limit=0），避免 BadgerDB Prefix 模式下游标分页的语义错误。
 func (m *Migrator) cleanShardData(ctx context.Context, shardID, sourceGID int, prefix string) error {
-	const batchSize = 100
 	totalDeleted := 0
 	numShards := m.source.TopologyNumShards()
 
-	for {
-		items, err := m.source.ScanGroup(ctx, sourceGID, prefix, int32(batchSize))
-		if err != nil {
-			return err
-		}
-		if len(items) == 0 {
-			break
-		}
+	items, err := m.source.ScanGroup(ctx, sourceGID, "", 0)
+	if err != nil {
+		return err
+	}
 
-		for _, item := range items {
-			if item == nil {
-				continue
-			}
-			if shardKey(item.GetKey(), numShards) != shardID {
-				continue
-			}
-			if _, err := m.source.DeleteFromGroup(ctx, sourceGID, item.GetKey()); err != nil {
-				log.Printf("[migrate] clean: delete %s failed: %v", item.GetKey(), err)
-				continue
-			}
-			totalDeleted++
+	for _, item := range items {
+		if item == nil {
+			continue
 		}
-		// 防止无限循环：如果所有返回的 key 都不属于目标 shard
-		if len(items) < batchSize {
-			break
+		key := item.GetKey()
+		if shardKey(key, numShards) != shardID {
+			continue
 		}
+		if prefix != "" && !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if _, err := m.source.DeleteFromGroup(ctx, sourceGID, key); err != nil {
+			log.Printf("[migrate] clean: delete %s failed: %v", key, err)
+			continue
+		}
+		totalDeleted++
 	}
 	log.Printf("[migrate] cleaned %d keys from source group %d", totalDeleted, sourceGID)
 	return nil

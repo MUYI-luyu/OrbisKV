@@ -110,12 +110,26 @@ func (h *TxHandle) Put(key string, value string, expectedVersion Tversion) {
 	}
 }
 
-// Delete 在事务内缓存一个删除操作（写入空值，带预期版本号）。
+// Delete 在事务内缓存一个删除操作。
+// 先读取 key 的当前版本（优先从 readSet 取，避免额外网络往返），
+// 用于 Commit 阶段的 CAS 校验——否则硬编码 Version: 0 会对已存在的 key
+// 导致版本冲突、对不存在的 key 意外创建空条目。
 func (h *TxHandle) Delete(key string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	h.writeSet[key] = WriteKey{Key: key, Value: "", Version: 0}
+	version := Tversion(0)
+	if rk, ok := h.readSet[key]; ok {
+		version = rk.ExpectedVersion
+	} else {
+		_, ver, _, e := h.coordinator.clerkGet(key)
+		if e == OK {
+			version = ver
+			h.readSet[key] = ReadKey{Key: key, ExpectedVersion: ver}
+		}
+	}
+
+	h.writeSet[key] = WriteKey{Key: key, Value: "", Version: version}
 	gid := h.coordinator.router.Resolve(key)
 	if gid >= 0 {
 		h.groups[gid] = true

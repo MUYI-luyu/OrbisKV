@@ -282,22 +282,41 @@ func TestTxHandleDeleteBuffersToWriteSet(t *testing.T) {
 	coordinator, mock, cleanup := setupCoordinatorTest(t)
 	defer cleanup()
 
-	seedMockKey(t, mock, "a", "val-a", 1)
+	t.Run("DeleteExistingKeyRecordsVersion", func(t *testing.T) {
+		seedMockKey(t, mock, "a", "val-a", 1)
 
-	h := coordinator.Begin()
-	h.Delete("a")
+		h := coordinator.Begin()
+		// 先 Get 记录版本，再 Delete——模拟标准用法
+		h.Get("a")
+		h.Delete("a")
 
-	// 验证 WriteSet 中包含 delete
-	h.mu.Lock()
-	wk, ok := h.writeSet["a"]
-	h.mu.Unlock()
+		h.mu.Lock()
+		wk, ok := h.writeSet["a"]
+		h.mu.Unlock()
 
-	if !ok {
-		t.Fatal("Delete 应写入 WriteSet")
-	}
-	if wk.Value != "" || wk.Version != 0 {
-		t.Fatalf("Delete 的 WriteKey 应为 {Value:\"\", Version:0}，实际: {Value:%q, Version:%d}", wk.Value, wk.Version)
-	}
+		if !ok {
+			t.Fatal("Delete 应写入 WriteSet")
+		}
+		if wk.Value != "" || wk.Version != 1 {
+			t.Fatalf("Delete 已有 key 的 WriteKey 应为 {Value:\"\", Version:1}，实际: {Value:%q, Version:%d}", wk.Value, wk.Version)
+		}
+	})
+
+	t.Run("DeleteNonExistentKeyVersionZero", func(t *testing.T) {
+		h := coordinator.Begin()
+		h.Delete("no-such-key")
+
+		h.mu.Lock()
+		wk, ok := h.writeSet["no-such-key"]
+		h.mu.Unlock()
+
+		if !ok {
+			t.Fatal("Delete 应写入 WriteSet")
+		}
+		if wk.Value != "" || wk.Version != 0 {
+			t.Fatalf("Delete 不存在的 key 的 WriteKey 应为 {Value:\"\", Version:0}，实际: {Value:%q, Version:%d}", wk.Value, wk.Version)
+		}
+	})
 }
 
 func TestTxHandleGetNonExistentKey(t *testing.T) {
