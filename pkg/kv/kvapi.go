@@ -4,6 +4,7 @@
 package kv
 
 import (
+	pb "kvraft/api/pb/kvraft/api/pb"
 	"kvraft/pkg/raft"
 	"kvraft/pkg/watch"
 )
@@ -20,10 +21,10 @@ const (
 	ErrWrongLeader Err = "ErrWrongLeader"
 	ErrVersion     Err = "ErrVersion"
 	ErrMaybe       Err = "ErrMaybe"
-	ErrWrongGroup  Err = "ErrWrongGroup"  // shard 不属于本 group
-	ErrTxConflict  Err = "ErrTxConflict"  // prepare 时版本冲突或 lock 已被持有
-	ErrTxNotFound  Err = "ErrTxNotFound"  // txID 不存在
-	ErrTxTimeout   Err = "ErrTxTimeout"   // prepare 超时
+	ErrWrongGroup  Err = "ErrWrongGroup" // shard 不属于本 group
+	ErrTxConflict  Err = "ErrTxConflict" // prepare 时版本冲突或 lock 已被持有
+	ErrTxNotFound  Err = "ErrTxNotFound" // txID 不存在
+	ErrTxTimeout   Err = "ErrTxTimeout"  // prepare 超时
 )
 
 // GetArgs 是 Get 操作的参数。
@@ -62,6 +63,33 @@ type DeleteArgs struct {
 type DeleteReply struct {
 	Err      Err
 	OldValue string
+}
+
+type CleanupShardKey struct {
+	Key             string
+	ExpectedVersion Tversion
+}
+
+type CleanupShardArgs struct {
+	ShardID int
+	Keys    []CleanupShardKey
+}
+
+type CleanupShardReply struct {
+	Deleted int
+	Err     Err
+}
+
+type SetShardStateArgs struct {
+	ShardID        int
+	State          pb.ShardState
+	TargetGroup    int
+	TopologyEpoch  int64
+	TargetReplicas []string
+}
+
+type SetShardStateReply struct {
+	Error string
 }
 
 // ScanArgs 是 Scan 操作的参数。
@@ -135,6 +163,7 @@ type RSMInterface interface {
 // ReadKey 描述事务中读取的一个 key，带预期版本用于冲突校验。
 type ReadKey struct {
 	Key             string
+	Value           string
 	ExpectedVersion Tversion
 }
 
@@ -144,6 +173,8 @@ type WriteKey struct {
 	Value string
 	// Version 是预期的当前版本（CAS）。0 表示 "key 必须不存在"。
 	Version Tversion
+	// IsDelete distinguishes transactional delete from an empty-value Put.
+	IsDelete bool
 }
 
 // PrepareTxArgs 是 Phase-1 请求：校验读集 + 获取写锁。
@@ -184,7 +215,7 @@ type AbortTxReply struct {
 type TxStatus int
 
 const (
-	TxStatusNotFound  TxStatus = iota
+	TxStatusNotFound TxStatus = iota
 	TxStatusPrepared
 	TxStatusCommitted
 	TxStatusAborted

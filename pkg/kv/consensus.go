@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	pb "kvraft/api/pb/kvraft/api/pb"
 	"kvraft/pkg/raft"
 	"kvraft/pkg/wal"
 	"kvraft/pkg/watch"
@@ -68,7 +69,6 @@ type RSM struct {
 	applyLoopProcessNanos int64
 	applyLoopIterCount    int64
 }
-
 
 func leaseReadEnabledFromEnv() bool {
 	v := strings.TrimSpace(strings.ToLower(os.Getenv("KV_LEASE_READ")))
@@ -152,7 +152,7 @@ func MakeRSM(
 	rsm.shutdown.Store(false)
 	rsm.leaseRead.Store(leaseReadEnabledFromEnv())
 	walPath := filepath.Join(runtimeDataRoot(), "wal", fmt.Sprintf("rsm-node-%d.log", me))
-	walEnabled := boolEnvDefault("KV_WAL_ENABLED", false)
+	walEnabled := boolEnvDefault("KV_WAL_ENABLED", true)
 	walSync := boolEnvDefault("KV_WAL_SYNC", true)
 	walLogger, err := wal.NewLogger(walPath, walEnabled, walSync)
 	if err != nil {
@@ -288,14 +288,59 @@ func walEntryFromOp(me int, commandIndex int, term int, oper Op) wal.Entry {
 		entry.OpType = "EXPIRE"
 		entry.Keys = append([]string(nil), t.Keys...)
 		entry.Cutoff = t.Cutoff
+	case *CleanupShardArgs, CleanupShardArgs:
+		t := reqPtr[CleanupShardArgs](oper.Req)
+		entry.OpType = "CLEANUP_SHARD"
+		entry.Version = int64(t.ShardID)
+		entry.Keys = make([]string, 0, len(t.Keys))
+		entry.Versions = make([]int64, 0, len(t.Keys))
+		for _, key := range t.Keys {
+			entry.Keys = append(entry.Keys, key.Key)
+			entry.Versions = append(entry.Versions, int64(key.ExpectedVersion))
+		}
+	case *SetShardStateArgs, SetShardStateArgs:
+		t := reqPtr[SetShardStateArgs](oper.Req)
+		entry.OpType = "SET_SHARD_STATE"
+		entry.ShardID = t.ShardID
+		entry.ShardState = int32(t.State)
+		entry.TargetGroup = t.TargetGroup
+		entry.Epoch = t.TopologyEpoch
+		entry.Replicas = append([]string(nil), t.TargetReplicas...)
 	case *PrepareTxArgs, PrepareTxArgs:
 		t := reqPtr[PrepareTxArgs](oper.Req)
 		entry.OpType = "PREPARE_TX"
 		entry.Key = t.TxID
+		entry.TxReadKeys = make([]string, 0, len(t.ReadKeys))
+		entry.TxReadVersions = make([]int64, 0, len(t.ReadKeys))
+		for _, k := range t.ReadKeys {
+			entry.TxReadKeys = append(entry.TxReadKeys, k.Key)
+			entry.TxReadVersions = append(entry.TxReadVersions, int64(k.ExpectedVersion))
+		}
+		entry.TxWriteKeys = make([]string, 0, len(t.WriteKeys))
+		entry.TxWriteValues = make([]string, 0, len(t.WriteKeys))
+		entry.TxWriteVersions = make([]int64, 0, len(t.WriteKeys))
+		entry.TxWriteDeletes = make([]bool, 0, len(t.WriteKeys))
+		for _, k := range t.WriteKeys {
+			entry.TxWriteKeys = append(entry.TxWriteKeys, k.Key)
+			entry.TxWriteValues = append(entry.TxWriteValues, k.Value)
+			entry.TxWriteVersions = append(entry.TxWriteVersions, int64(k.Version))
+			entry.TxWriteDeletes = append(entry.TxWriteDeletes, k.IsDelete)
+		}
+		entry.TxTimeoutMs = t.TimeoutMs
 	case *CommitTxArgs, CommitTxArgs:
 		t := reqPtr[CommitTxArgs](oper.Req)
 		entry.OpType = "COMMIT_TX"
 		entry.Key = t.TxID
+		entry.TxWriteKeys = make([]string, 0, len(t.WriteKeys))
+		entry.TxWriteValues = make([]string, 0, len(t.WriteKeys))
+		entry.TxWriteVersions = make([]int64, 0, len(t.WriteKeys))
+		entry.TxWriteDeletes = make([]bool, 0, len(t.WriteKeys))
+		for _, k := range t.WriteKeys {
+			entry.TxWriteKeys = append(entry.TxWriteKeys, k.Key)
+			entry.TxWriteValues = append(entry.TxWriteValues, k.Value)
+			entry.TxWriteVersions = append(entry.TxWriteVersions, int64(k.Version))
+			entry.TxWriteDeletes = append(entry.TxWriteDeletes, k.IsDelete)
+		}
 	case *AbortTxArgs, AbortTxArgs:
 		t := reqPtr[AbortTxArgs](oper.Req)
 		entry.OpType = "ABORT_TX"
@@ -331,10 +376,39 @@ func walEntryToRequest(entry wal.Entry) (any, bool, error) {
 			Keys:   append([]string(nil), entry.Keys...),
 			Cutoff: entry.Cutoff,
 		}, true, nil
+	case "CLEANUP_SHARD":
+		if len(entry.Keys) != len(entry.Versions) {
+			return nil, false, fmt.Errorf("invalid cleanup shard WAL entry")
+		}
+		keys := make([]CleanupShardKey, 0, len(entry.Keys))
+		for i, key := range entry.Keys {
+			keys = append(keys, CleanupShardKey{Key: key, ExpectedVersion: Tversion(entry.Versions[i])})
+		}
+		return &CleanupShardArgs{ShardID: int(entry.Version), Keys: keys}, true, nil
+	case "SET_SHARD_STATE":
+		return &SetShardStateArgs{ShardID: entry.ShardID, State: pb.ShardState(entry.ShardState), TargetGroup: entry.TargetGroup, TopologyEpoch: entry.Epoch, TargetReplicas: append([]string(nil), entry.Replicas...)}, true, nil
 	case "PREPARE_TX":
-		return &PrepareTxArgs{TxID: entry.Key}, true, nil
+		if len(entry.TxReadKeys) != len(entry.TxReadVersions) || len(entry.TxWriteKeys) != len(entry.TxWriteValues) || len(entry.TxWriteKeys) != len(entry.TxWriteVersions) || len(entry.TxWriteKeys) != len(entry.TxWriteDeletes) {
+			return nil, false, fmt.Errorf("invalid prepare tx WAL entry")
+		}
+		reads := make([]ReadKey, 0, len(entry.TxReadKeys))
+		for i, key := range entry.TxReadKeys {
+			reads = append(reads, ReadKey{Key: key, ExpectedVersion: Tversion(entry.TxReadVersions[i])})
+		}
+		writes := make([]WriteKey, 0, len(entry.TxWriteKeys))
+		for i, key := range entry.TxWriteKeys {
+			writes = append(writes, WriteKey{Key: key, Value: entry.TxWriteValues[i], Version: Tversion(entry.TxWriteVersions[i]), IsDelete: entry.TxWriteDeletes[i]})
+		}
+		return &PrepareTxArgs{TxID: entry.Key, ReadKeys: reads, WriteKeys: writes, TimeoutMs: entry.TxTimeoutMs}, true, nil
 	case "COMMIT_TX":
-		return &CommitTxArgs{TxID: entry.Key}, true, nil
+		if len(entry.TxWriteKeys) != len(entry.TxWriteValues) || len(entry.TxWriteKeys) != len(entry.TxWriteVersions) || len(entry.TxWriteKeys) != len(entry.TxWriteDeletes) {
+			return nil, false, fmt.Errorf("invalid commit tx WAL entry")
+		}
+		writes := make([]WriteKey, 0, len(entry.TxWriteKeys))
+		for i, key := range entry.TxWriteKeys {
+			writes = append(writes, WriteKey{Key: key, Value: entry.TxWriteValues[i], Version: Tversion(entry.TxWriteVersions[i]), IsDelete: entry.TxWriteDeletes[i]})
+		}
+		return &CommitTxArgs{TxID: entry.Key, WriteKeys: writes}, true, nil
 	case "ABORT_TX":
 		return &AbortTxArgs{TxID: entry.Key}, true, nil
 	case "RESOLVE_TX_STATUS":
@@ -610,7 +684,7 @@ func (rsm *RSM) applySnapshot(msg raft.ApplyMsg) {
 	rsm.truncateWALAsync(msg.SnapshotIndex)
 }
 
-func (rsm *RSM) createSnapshot(lastIncludedIndex int) {
+func (rsm *RSM) createSnapshot(snapshotToIndex int) {
 	if rsm.shutdown.Load() {
 		return
 	}
@@ -620,12 +694,12 @@ func (rsm *RSM) createSnapshot(lastIncludedIndex int) {
 	idctr := atomic.LoadInt64(&rsm.idCounter)
 	e.Encode(idctr)
 	e.Encode(smSnapshot)
-	rsm.rf.Snapshot(lastIncludedIndex, w.Bytes())
-	rsm.truncateWALAsync(lastIncludedIndex)
+	rsm.rf.Snapshot(snapshotToIndex, w.Bytes())
+	rsm.truncateWALAsync(snapshotToIndex)
 	rsm.mu.Lock()
-	rsm.lastSnapIndex = lastIncludedIndex
-	if lastIncludedIndex > rsm.lastApplied {
-		rsm.lastApplied = lastIncludedIndex
+	rsm.lastSnapIndex = snapshotToIndex
+	if snapshotToIndex > rsm.lastApplied {
+		rsm.lastApplied = snapshotToIndex
 	}
 	rsm.lastSnapAt = time.Now()
 	rsm.mu.Unlock()

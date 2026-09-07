@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,11 @@ type kvEntry struct {
 const (
 	txKeyPrefix = "_tx:"
 )
+
+type snapshotEnvelope struct {
+	KV        map[string]kvEntry `json:"kv"`
+	TxRecords map[string][]byte  `json:"tx_records,omitempty"`
+}
 
 // WriteBatchOp 描述单次 WriteBatchWithCAS 中的一个原子写操作。
 type WriteBatchOp struct {
@@ -314,6 +320,47 @@ func (s *Store) writeBatchWithCASInTxn(txn *badger.Txn, ops []WriteBatchOp) erro
 	return nil
 }
 
+// RollbackCASMutation conditionally restores the value that existed before a
+// migration double-write. expectedCurrentVersion is the local version produced
+// by the mutation; zero means the key is expected to be absent (delete rollback).
+func (s *Store) RollbackCASMutation(key string, expectedCurrentVersion uint64, previousValue string, previousVersion uint64, previousExpires int64, previousExists bool) error {
+	err := s.db.Update(func(txn *badger.Txn) error {
+		item, getErr := txn.Get([]byte(key))
+		if expectedCurrentVersion == 0 {
+			if getErr != badger.ErrKeyNotFound {
+				return fmt.Errorf("rollback expected key %q absent", key)
+			}
+		} else {
+			if getErr != nil {
+				return fmt.Errorf("rollback read key %q: %w", key, getErr)
+			}
+			raw, copyErr := item.ValueCopy(nil)
+			if copyErr != nil {
+				return copyErr
+			}
+			var current kvEntry
+			if jsonErr := json.Unmarshal(raw, &current); jsonErr != nil {
+				return jsonErr
+			}
+			if current.Version != expectedCurrentVersion {
+				return fmt.Errorf("rollback version mismatch for key %q: expected %d, got %d", key, expectedCurrentVersion, current.Version)
+			}
+		}
+		if !previousExists {
+			return txn.Delete([]byte(key))
+		}
+		raw, marshalErr := json.Marshal(kvEntry{Value: previousValue, Version: previousVersion, Expires: previousExpires})
+		if marshalErr != nil {
+			return marshalErr
+		}
+		return txn.Set([]byte(key), raw)
+	})
+	if err == nil && previousExists && previousExpires > 0 {
+		s.trackExpiry(key, previousExpires)
+	}
+	return err
+}
+
 // WriteBatchWithCAS 在单个 BadgerDB 事务中原子执行多条 CAS 写操作。
 // 每条 op 在 txn 内先 Get 当前版本，比对 ExpectedVersion，再 Set。
 // 任何一个冲突就整体回滚。
@@ -580,10 +627,16 @@ func (s *Store) GetAll() (map[string]kvEntry, error) {
 
 // LoadSnapshot 从编码的快照数据中恢复存储
 func (s *Store) LoadSnapshot(snapshotData []byte) error {
-	var snapshot map[string]kvEntry
-	if err := json.Unmarshal(snapshotData, &snapshot); err != nil {
+	var envelope snapshotEnvelope
+	if err := json.Unmarshal(snapshotData, &envelope); err != nil {
 		return fmt.Errorf("反序列化快照失败: %w", err)
 	}
+	if envelope.KV == nil {
+		if err := json.Unmarshal(snapshotData, &envelope.KV); err != nil {
+			return fmt.Errorf("反序列化快照失败: %w", err)
+		}
+	}
+	snapshot := envelope.KV
 
 	// 创建临时库
 	ts := time.Now().UnixNano()
@@ -614,6 +667,13 @@ func (s *Store) LoadSnapshot(snapshotData []byte) error {
 			_ = tmpDB.Close()
 			_ = os.RemoveAll(tmpPath)
 			return fmt.Errorf("写入临时恢复数据库失败: %w", putErr)
+		}
+	}
+	for key, data := range envelope.TxRecords {
+		if putErr := tmpDB.Update(func(txn *badger.Txn) error { return txn.Set([]byte(key), data) }); putErr != nil {
+			_ = tmpDB.Close()
+			_ = os.RemoveAll(tmpPath)
+			return fmt.Errorf("写入事务快照记录失败: %w", putErr)
 		}
 	}
 
@@ -668,12 +728,33 @@ func (s *Store) LoadSnapshot(snapshotData []byte) error {
 
 // SaveSnapshot 将当前存储导出为快照数据
 func (s *Store) SaveSnapshot() ([]byte, error) {
-	data, err := s.GetAll()
+	envelope := snapshotEnvelope{KV: make(map[string]kvEntry), TxRecords: make(map[string][]byte)}
+	err := s.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := string(item.KeyCopy(nil))
+			value, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+			if strings.HasPrefix(key, txKeyPrefix) {
+				envelope.TxRecords[key] = value
+				continue
+			}
+			var entry kvEntry
+			if err := json.Unmarshal(value, &entry); err != nil {
+				return err
+			}
+			envelope.KV[key] = entry
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	return json.Marshal(data)
+	return json.Marshal(envelope)
 }
 
 // Close 关闭数据库连接

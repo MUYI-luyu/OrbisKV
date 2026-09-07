@@ -34,6 +34,8 @@ func StartKVServer(servers []string, gid int, me int, persister raft.Persister, 
 	gob.Register(PutArgs{})
 	gob.Register(GetArgs{})
 	gob.Register(DeleteArgs{})
+	gob.Register(CleanupShardArgs{})
+	gob.Register(SetShardStateArgs{})
 	gob.Register(ScanArgs{})
 	gob.Register(ExpireArgs{})
 	gob.Register(PrepareTxArgs{})

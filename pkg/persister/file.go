@@ -287,7 +287,7 @@ func (fp *FilePersister) startWorkerLocked() {
 	fp.appendReqCh = make(chan appendStateRequest, 1024)
 	fp.stopCh = make(chan struct{})
 	fp.workerDone = make(chan struct{})
-	go fp.runWorker()
+	go fp.runWorker(fp.reqCh, fp.hardReqCh, fp.appendReqCh, fp.stopCh, fp.workerDone, fp.batchSize)
 }
 
 // 关闭任务管道
@@ -303,15 +303,15 @@ func (fp *FilePersister) stopWorkerLocked() (chan struct{}, chan struct{}) {
 }
 
 // 启动带有定时刷新功能的异步批处理状态机
-func (fp *FilePersister) runWorker() {
-	defer close(fp.workerDone)
+func (fp *FilePersister) runWorker(reqCh <-chan saveRequest, hardReqCh <-chan hardStateRequest, appendReqCh <-chan appendStateRequest, stopCh <-chan struct{}, workerDone chan struct{}, batchSize int) {
+	defer close(workerDone)
 
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 
-	batch := make([]saveRequest, 0, fp.batchSize)
-	hardBatch := make([]hardStateRequest, 0, fp.batchSize)
-	appendBatch := make([]appendStateRequest, 0, fp.batchSize)
+	batch := make([]saveRequest, 0, batchSize)
+	hardBatch := make([]hardStateRequest, 0, batchSize)
+	appendBatch := make([]appendStateRequest, 0, batchSize)
 
 	flush := func() {
 		// 处理硬状态
@@ -361,24 +361,24 @@ func (fp *FilePersister) runWorker() {
 
 	for {
 		select {
-		case req := <-fp.reqCh: // 全量保存请求
+		case req := <-reqCh: // 全量保存请求
 			batch = append(batch, req)
-			if len(batch) >= fp.batchSize {
+			if len(batch) >= batchSize {
 				flush()
 			}
-		case req := <-fp.hardReqCh: // 硬状态请求
+		case req := <-hardReqCh: // 硬状态请求
 			hardBatch = append(hardBatch, req)
-			if len(hardBatch) >= fp.batchSize {
+			if len(hardBatch) >= batchSize {
 				flush()
 			}
-		case req := <-fp.appendReqCh: // 增量追加请求
+		case req := <-appendReqCh: // 增量追加请求
 			appendBatch = append(appendBatch, req)
-			if len(appendBatch) >= fp.batchSize {
+			if len(appendBatch) >= batchSize {
 				flush()
 			}
 		case <-ticker.C:
 			flush()
-		case <-fp.stopCh:
+		case <-stopCh:
 			flush()
 			return
 		}

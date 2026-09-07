@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -60,9 +61,8 @@ type KVServer struct {
 	grpcLn           net.Listener
 	grpcSrv          *grpc.Server
 	shardMgr         *shardStateManager // shard 状态机（迁移时控制双写/拒绝）
-	txMgr            *TxManager          // 2PC 事务管理器
+	txMgr            *TxManager         // 2PC 事务管理器
 }
-
 
 type ServerStats struct {
 	TotalRequests  int64
@@ -104,14 +104,27 @@ func (kv *KVServer) TopologyEpoch() int64 {
 
 // SetShardState 修改本节点上 shard 的状态（由迁移协调器调用）。
 func (kv *KVServer) SetShardState(shardID int, state pb.ShardState, targetGroup int, epoch int64, targetReplicas []string) error {
-	if err := kv.shardMgr.SetShardState(shardID, state, targetGroup, epoch); err != nil {
+	if err := kv.shardMgr.validateShardID(shardID); err != nil {
 		return err
 	}
-	// 如果是 MIGRATING 状态，预先建立到目标 group 的转发连接
+	// Network setup is deliberately outside the replicated state-machine apply path.
 	if state == pb.ShardState_MIGRATING && len(targetReplicas) > 0 {
 		if _, err := kv.shardMgr.ensureForwardClient(targetGroup, targetReplicas); err != nil {
 			return fmt.Errorf("forward client setup failed: %w", err)
 		}
+	}
+	if kv.rsm == nil {
+		return fmt.Errorf("rsm is not configured")
+	}
+	err, ret := kv.rsm.Submit(&SetShardStateArgs{ShardID: shardID, State: state, TargetGroup: targetGroup, TopologyEpoch: epoch, TargetReplicas: targetReplicas})
+	if err != OK {
+		return fmt.Errorf("set shard state: %s", err)
+	}
+	if reply, ok := ret.(SetShardStateReply); !ok || reply.Error != "" {
+		if ok && reply.Error != "" {
+			return fmt.Errorf("set shard state: %s", reply.Error)
+		}
+		return fmt.Errorf("set shard state: invalid reply")
 	}
 	return nil
 }
@@ -132,12 +145,16 @@ func (kv *KVServer) GetShardStates() ([]*pb.ShardStateEntry, int64) {
 
 func (kv *KVServer) DoOp(req any) any {
 	switch req.(type) {
+	case *SetShardStateArgs, SetShardStateArgs:
+		return kv.doSetShardState(reqPtr[SetShardStateArgs](req))
 	case *GetArgs, GetArgs:
 		return kv.doGet(reqPtr[GetArgs](req))
 	case *PutArgs, PutArgs:
 		return kv.doPut(reqPtr[PutArgs](req))
 	case *DeleteArgs, DeleteArgs:
 		return kv.doDelete(reqPtr[DeleteArgs](req))
+	case *CleanupShardArgs, CleanupShardArgs:
+		return kv.doCleanupShard(reqPtr[CleanupShardArgs](req))
 	case *ScanArgs, ScanArgs:
 		return kv.doScan(reqPtr[ScanArgs](req))
 	case *ExpireArgs, ExpireArgs:
@@ -154,6 +171,30 @@ func (kv *KVServer) DoOp(req any) any {
 		log.Printf("[KVServer-%d] Unknown request type: %T", kv.me, req)
 		return GetReply{Err: ErrWrongLeader}
 	}
+}
+
+func (kv *KVServer) doSetShardState(args *SetShardStateArgs) SetShardStateReply {
+	if err := kv.shardMgr.SetShardState(args.ShardID, args.State, args.TargetGroup, args.TopologyEpoch, args.TargetReplicas); err != nil {
+		return SetShardStateReply{Error: err.Error()}
+	}
+	return SetShardStateReply{}
+}
+
+func (kv *KVServer) doCleanupShard(args *CleanupShardArgs) CleanupShardReply {
+	if kv.killed() {
+		return CleanupShardReply{Err: ErrWrongLeader}
+	}
+	ops := make([]storage.WriteBatchOp, 0, len(args.Keys))
+	for _, key := range args.Keys {
+		if kv.shardForKey(key.Key) != args.ShardID {
+			return CleanupShardReply{Err: ErrWrongGroup}
+		}
+		ops = append(ops, storage.WriteBatchOp{Key: key.Key, ExpectedVersion: uint64(key.ExpectedVersion), IsDelete: true})
+	}
+	if err := kv.store.WriteBatchWithCAS(ops); err != nil {
+		return CleanupShardReply{Err: ErrVersion}
+	}
+	return CleanupShardReply{Deleted: len(ops), Err: OK}
 }
 
 func (kv *KVServer) doGet(args *GetArgs) GetReply {
@@ -238,6 +279,16 @@ func (kv *KVServer) doPut(args *PutArgs) PutReply {
 // 转发失败则整体失败（CP 语义：双写必须同时成功）。
 func (kv *KVServer) doPutWithForward(args *PutArgs, meta shardMeta) PutReply {
 	now := time.Now().UnixNano()
+	previousValue, previousVersion, previousExpires, previousExists, readErr := kv.store.Get(args.Key)
+	if readErr != nil {
+		return PutReply{Err: ErrWrongLeader}
+	}
+	if previousExists && isExpired(previousExpires, now) {
+		previousExists = false
+		previousVersion = 0
+		previousExpires = 0
+		previousValue = ""
+	}
 	newExpires := absoluteExpiryFromTTL(args.TTL, now)
 	oldValue, status, err := kv.store.PutCASWithTTL(args.Key, args.Value, uint64(args.Version), newExpires)
 	if err != nil {
@@ -255,7 +306,15 @@ func (kv *KVServer) doPutWithForward(args *PutArgs, meta shardMeta) PutReply {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if fwdErr := kv.shardMgr.ForwardWrite(ctx, meta.targetGroup, args.Key, args.Value, int64(args.Version)); fwdErr != nil {
-		log.Printf("[KVServer-%d] forward write to group %d failed: %v", kv.me, meta.targetGroup, fwdErr)
+		producedVersion := uint64(1)
+		if previousExists {
+			producedVersion = previousVersion + 1
+		}
+		if rollbackErr := kv.store.RollbackCASMutation(args.Key, producedVersion, previousValue, previousVersion, previousExpires, previousExists); rollbackErr != nil {
+			log.Printf("[KVServer-%d] forward write failed and source rollback failed: forward=%v rollback=%v", kv.me, fwdErr, rollbackErr)
+			return PutReply{Err: ErrMaybe}
+		}
+		log.Printf("[KVServer-%d] forward write to group %d failed; source restored: %v", kv.me, meta.targetGroup, fwdErr)
 		return PutReply{Err: ErrWrongGroup}
 	}
 	return PutReply{Err: OK, OldValue: oldValue}
@@ -264,7 +323,7 @@ func (kv *KVServer) doPutWithForward(args *PutArgs, meta shardMeta) PutReply {
 // doDeleteWithForward 在 MIGRATING 状态下：本地删除后转发到目标 group。
 func (kv *KVServer) doDeleteWithForward(args *DeleteArgs, meta shardMeta) DeleteReply {
 	now := time.Now().UnixNano()
-	oldValue, _, expires, exists, err := kv.store.Get(args.Key)
+	oldValue, oldVersion, expires, exists, err := kv.store.Get(args.Key)
 	if err != nil {
 		log.Printf("[KVServer-%d] Get error during delete migration: %v", kv.me, err)
 		kv.stats.RecordFailure()
@@ -287,7 +346,11 @@ func (kv *KVServer) doDeleteWithForward(args *DeleteArgs, meta shardMeta) Delete
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if fwdErr := kv.shardMgr.ForwardDelete(ctx, meta.targetGroup, args.Key); fwdErr != nil {
-		log.Printf("[KVServer-%d] forward delete to group %d failed: %v", kv.me, meta.targetGroup, fwdErr)
+		if rollbackErr := kv.store.RollbackCASMutation(args.Key, 0, oldValue, oldVersion, expires, true); rollbackErr != nil {
+			log.Printf("[KVServer-%d] forward delete failed and source rollback failed: forward=%v rollback=%v", kv.me, fwdErr, rollbackErr)
+			return DeleteReply{Err: ErrMaybe}
+		}
+		log.Printf("[KVServer-%d] forward delete to group %d failed; source restored: %v", kv.me, meta.targetGroup, fwdErr)
 		return DeleteReply{Err: ErrWrongGroup}
 	}
 	return DeleteReply{Err: OK, OldValue: oldValue}
@@ -408,14 +471,34 @@ func (kv *KVServer) Snapshot() []byte {
 		log.Printf("[KVServer-%d] Snapshot error: %v", kv.me, err)
 		return nil
 	}
-	return data
+	snapshot, err := json.Marshal(struct {
+		Store  json.RawMessage    `json:"store"`
+		Shards shardStateSnapshot `json:"shards"`
+	}{Store: json.RawMessage(data), Shards: kv.shardMgr.Snapshot()})
+	if err != nil {
+		log.Printf("[KVServer-%d] Snapshot metadata error: %v", kv.me, err)
+		return nil
+	}
+	return snapshot
 }
 
 func (kv *KVServer) Restore(data []byte) {
 	if len(data) == 0 {
 		return
 	}
-	if err := kv.store.LoadSnapshot(data); err != nil {
+	var envelope struct {
+		Store  json.RawMessage    `json:"store"`
+		Shards shardStateSnapshot `json:"shards"`
+	}
+	if err := json.Unmarshal(data, &envelope); err == nil && len(envelope.Store) > 0 && len(envelope.Shards.States) > 0 {
+		if err := kv.store.LoadSnapshot(envelope.Store); err != nil {
+			log.Printf("[KVServer-%d] Restore snapshot error: %v", kv.me, err)
+			return
+		}
+		if err := kv.shardMgr.Restore(envelope.Shards); err != nil {
+			log.Printf("[KVServer-%d] Restore shard state error: %v", kv.me, err)
+		}
+	} else if err := kv.store.LoadSnapshot(data); err != nil {
 		log.Printf("[KVServer-%d] Restore snapshot error: %v", kv.me, err)
 	}
 	// 快照恢复后重建 lock table（_tx:prepare:* 记录已随 store 恢复）

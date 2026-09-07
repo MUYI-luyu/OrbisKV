@@ -31,6 +31,9 @@ type ShardingConfig struct {
 	PreferredReplicas int
 	ConnectTimeout    time.Duration
 	RequestTimeout    time.Duration
+	// ShardToGroup preserves explicit shard ownership across topology reloads.
+	ShardToGroup  []int
+	TopologyEpoch int64
 }
 
 // ShardRouter 基于 ShardTopology 将请求路由到对应分组。
@@ -100,7 +103,14 @@ func NewShardRouter(cfg ShardingConfig) (*ShardRouter, error) {
 		r.groupsByID[g.GroupID] = g
 		topoGroups[g.GroupID] = g.Replicas
 	}
-	r.topology = NewShardTopology(cfg.NumShards, topoGroups)
+	if len(cfg.ShardToGroup) == 0 {
+		r.topology = NewShardTopology(cfg.NumShards, topoGroups)
+	} else {
+		r.topology = NewShardTopologyWithOwnership(cfg.NumShards, topoGroups, cfg.ShardToGroup, cfg.TopologyEpoch)
+		if r.topology == nil {
+			return nil, fmt.Errorf("invalid explicit shard ownership")
+		}
+	}
 
 	// 连接初始化
 	if err := r.initConnections(); err != nil {
@@ -149,6 +159,30 @@ func (r *ShardRouter) initConnections() error {
 
 // Resolve 返回 key 对应的分组 ID。
 // 使用 ShardTopology 的 shard 抽象：key → shard → group，O(1)。
+// Ownership returns the explicit shard owner table used by this router.
+func (r *ShardRouter) Ownership() []int {
+	if r.topology == nil {
+		return nil
+	}
+	return r.topology.Ownership()
+}
+
+// GroupForShard returns the current owner group for a shard.
+func (r *ShardRouter) GroupForShard(shard int) (int, bool) {
+	if r.topology == nil {
+		return 0, false
+	}
+	return r.topology.GroupForShard(shard)
+}
+
+// PlanAddGroup computes expansion ownership without mutating this router.
+func (r *ShardRouter) PlanAddGroup(gid int, replicas []string) ([]int, []int) {
+	if r.topology == nil {
+		return nil, nil
+	}
+	return r.topology.PlanAddGroup(gid, replicas)
+}
+
 func (r *ShardRouter) Resolve(key string) int {
 	if r.topology == nil {
 		return -1

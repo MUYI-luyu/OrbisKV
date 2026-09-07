@@ -25,7 +25,6 @@ type TxHandle struct {
 	writeSet    map[string]WriteKey
 	groups      map[int]bool
 	coordinator *TxCoordinator
-	startedAt   time.Time
 	timeoutMs   int64
 	mu          sync.Mutex
 }
@@ -33,7 +32,6 @@ type TxHandle struct {
 // TxCoordinator 在客户端管理 2PC 事务生命周期。
 // 嵌入在 Clerk 中，复用现有的 ShardRouter 进行路由。
 type TxCoordinator struct {
-	mu     sync.Mutex
 	router *sharding.ShardRouter
 }
 
@@ -50,7 +48,6 @@ func (tc *TxCoordinator) Begin() *TxHandle {
 		writeSet:    make(map[string]WriteKey),
 		groups:      make(map[int]bool),
 		coordinator: tc,
-		startedAt:   time.Now(),
 		timeoutMs:   txDefaultTimeoutMs,
 	}
 }
@@ -75,17 +72,8 @@ func (h *TxHandle) Get(key string) (value string, version Tversion, err Err) {
 
 	// 再查 ReadSet
 	if rk, ok := h.readSet[key]; ok {
-		// 从 server 重新读取以验证
-		val, ver, _, e := h.coordinator.clerkGet(key)
-		if e != OK {
-			return "", 0, e
-		}
-		// 更新 ReadSet 为最新值
-		h.readSet[key] = ReadKey{Key: key, ExpectedVersion: ver}
-		if val != rk.Key {
-			_ = rk // 之前读的值
-		}
-		return val, ver, OK
+		// Keep the first-read version as the optimistic validation baseline.
+		return rk.Value, rk.ExpectedVersion, OK
 	}
 
 	// 从 server 读取
@@ -94,7 +82,7 @@ func (h *TxHandle) Get(key string) (value string, version Tversion, err Err) {
 		return "", 0, e
 	}
 
-	h.readSet[key] = ReadKey{Key: key, ExpectedVersion: ver}
+	h.readSet[key] = ReadKey{Key: key, Value: val, ExpectedVersion: ver}
 	return val, ver, OK
 }
 
@@ -129,7 +117,7 @@ func (h *TxHandle) Delete(key string) {
 		}
 	}
 
-	h.writeSet[key] = WriteKey{Key: key, Value: "", Version: version}
+	h.writeSet[key] = WriteKey{Key: key, Value: "", Version: version, IsDelete: true}
 	gid := h.coordinator.router.Resolve(key)
 	if gid >= 0 {
 		h.groups[gid] = true
@@ -328,9 +316,10 @@ func writeKeysToProto(keys []WriteKey) []*pb.WriteKey {
 	pbKeys := make([]*pb.WriteKey, 0, len(keys))
 	for _, k := range keys {
 		pbKeys = append(pbKeys, &pb.WriteKey{
-			Key:     k.Key,
-			Value:   k.Value,
-			Version: int64(k.Version),
+			Key:      k.Key,
+			Value:    k.Value,
+			Version:  int64(k.Version),
+			IsDelete: k.IsDelete,
 		})
 	}
 	return pbKeys

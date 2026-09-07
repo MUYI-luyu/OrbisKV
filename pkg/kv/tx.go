@@ -238,7 +238,7 @@ func (tm *TxManager) Commit(args *CommitTxArgs) CommitTxReply {
 			Key:             wk.Key,
 			Value:           wk.Value,
 			ExpectedVersion: uint64(wk.Version),
-			IsDelete:        false,
+			IsDelete:        wk.IsDelete,
 		})
 	}
 

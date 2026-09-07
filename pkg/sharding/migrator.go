@@ -194,6 +194,17 @@ func (m *Migrator) rollbackTarget(ctx context.Context, item MigrationPlanItem, b
 }
 
 func (m *Migrator) deleteSourceWithVerify(ctx context.Context, item MigrationPlanItem) error {
+	srcBefore, err := m.fetchGroupValue(ctx, m.source, item.SourceGroup, item.Key)
+	if err != nil {
+		return err
+	}
+	if srcBefore.GetError() != "OK" {
+		return fmt.Errorf("source key disappeared before delete")
+	}
+	if srcBefore.GetValue() != item.Value {
+		return fmt.Errorf("source value changed for key %s", item.Key)
+	}
+
 	delCtx, cancelDel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	delResp, delErr := m.source.DeleteFromGroup(delCtx, item.SourceGroup, item.Key)
 	cancelDel()
@@ -320,7 +331,7 @@ func (m *Migrator) ExecutePlan(ctx context.Context, plan []MigrationPlanItem, de
 	return stats, nil
 }
 
-// connectToKVService 建立到指定 group 中第一个可达 replica 的 KVService 连接。
+// connectToKVService 建立到指定 group leader 的 KVService 连接。
 func connectToKVService(ctx context.Context, router *ShardRouter, gid int) (pb.KVServiceClient, *grpc.ClientConn, error) {
 	addrs := router.groupReplicaAddrs(gid)
 	if len(addrs) == 0 {
@@ -334,9 +345,14 @@ func connectToKVService(ctx context.Context, router *ShardRouter, gid int) (pb.K
 		if err != nil {
 			continue
 		}
-		return pb.NewKVServiceClient(conn), conn, nil
+		client := pb.NewKVServiceClient(conn)
+		status, statusErr := client.GetClusterStatus(ctx, &pb.ClusterStatusRequest{})
+		if statusErr == nil && len(status.GetNodes()) > 0 && status.GetNodes()[0].GetIsLeader() {
+			return client, conn, nil
+		}
+		_ = conn.Close()
 	}
-	return nil, nil, fmt.Errorf("no reachable replica for group %d", gid)
+	return nil, nil, fmt.Errorf("no reachable leader for group %d", gid)
 }
 
 // shardKey 计算 key 所属的 shard ID。
@@ -358,12 +374,13 @@ func (r *ShardRouter) groupReplicaAddrs(gid int) []string {
 // MigrateShardOnline 在线迁移一个 shard，迁移期间不停止写入（6 阶段）。
 //
 // 流程：
-//   Phase 1: target ← IMPORTING
-//   Phase 2: source ← MIGRATING(target)    ← 双写开始
-//   Phase 3: 批量同步存量数据
-//   Phase 4: target ← OWNED                ← 双写结束
-//   Phase 5: source ← ABSENT
-//   Phase 6: 清理源数据
+//
+//	Phase 1: target ← IMPORTING
+//	Phase 2: source ← MIGRATING(target)    ← 双写开始
+//	Phase 3: 批量同步存量数据
+//	Phase 4: target ← OWNED                ← 双写结束
+//	Phase 5: source ← ABSENT
+//	Phase 6: 清理源数据
 func (m *Migrator) MigrateShardOnline(ctx context.Context, shardID int, sourceGID, targetGID int, prefix string) error {
 	if m == nil || m.source == nil || m.target == nil {
 		return fmt.Errorf("migrator is nil")
@@ -385,81 +402,179 @@ func (m *Migrator) MigrateShardOnline(ctx context.Context, shardID int, sourceGI
 		return fmt.Errorf("connect to target group %d: %w", targetGID, err)
 	}
 	defer tgtConn.Close()
+	sourceOriginal, err := readRemoteShardState(ctx, src, shardID)
+	if err != nil {
+		return fmt.Errorf("read source shard state: %w", err)
+	}
+	targetOriginal, err := readRemoteShardState(ctx, tgt, shardID)
+	if err != nil {
+		return fmt.Errorf("read target shard state: %w", err)
+	}
 
 	baseEpoch := m.source.TopologyEpoch()
 	nextEpoch := baseEpoch + 1
 
 	// Phase 1: Target ← IMPORTING（准备接收）
 	log.Printf("[migrate] Phase 1: shard=%d target=%d ← IMPORTING", shardID, targetGID)
-	if _, err := tgt.SetShardState(ctx, &pb.SetShardStateRequest{
+	if err := setRemoteShardState(ctx, tgt, &pb.SetShardStateRequest{
 		ShardId: int32(shardID), State: pb.ShardState_IMPORTING,
 		TargetGroup: int32(sourceGID), TopologyEpoch: nextEpoch,
 	}); err != nil {
 		return fmt.Errorf("phase 1 target.IMPORTING failed: %w", err)
 	}
 	nextEpoch++
+	phase1Done := true
 
 	// Phase 2: Source ← MIGRATING(target)（双写开始）
 	log.Printf("[migrate] Phase 2: shard=%d source=%d ← MIGRATING → target=%d", shardID, sourceGID, targetGID)
 	// 获取 target group 的 replica 地址列表供双写转发使用
 	targetReplicas := m.target.groupReplicaAddrs(targetGID)
-	if _, err := src.SetShardState(ctx, &pb.SetShardStateRequest{
+	if err := setRemoteShardState(ctx, src, &pb.SetShardStateRequest{
 		ShardId: int32(shardID), State: pb.ShardState_MIGRATING,
-		TargetGroup: int32(targetGID), TopologyEpoch: nextEpoch,
+		TargetGroup: int32(targetGID), TopologyEpoch: nextEpoch, TargetReplicas: targetReplicas,
 	}); err != nil {
 		// 回滚 Phase 1
-		tgt.SetShardState(ctx, &pb.SetShardStateRequest{
-			ShardId: int32(shardID), State: pb.ShardState_OWNED, TopologyEpoch: nextEpoch + 1,
-		})
+		_ = restoreRemoteShardState(ctx, tgt, shardID, targetOriginal, nextEpoch+1)
 		return fmt.Errorf("phase 2 source.MIGRATING failed: %w", err)
 	}
-	_ = targetReplicas // replicas are already configured on the source server
 	nextEpoch++
+	phase2Done := true
 
 	// Phase 3: 批量同步存量数据
 	log.Printf("[migrate] Phase 3: shard=%d bulk copy data", shardID)
-	if err := m.bulkCopyShard(ctx, shardID, sourceGID, targetGID, prefix); err != nil {
-		return fmt.Errorf("phase 3 bulk copy failed: %w", err)
+	copied, err := m.bulkCopyShard(ctx, shardID, sourceGID, targetGID, prefix)
+	if err != nil {
+		rollbackErr := m.rollbackOnlineMigration(src, tgt, shardID, sourceOriginal, targetOriginal, phase1Done, phase2Done, copied)
+		return combineMigrationErrors(fmt.Errorf("phase 3 bulk copy failed: %w", err), rollbackErr)
 	}
 
 	// Phase 4: Target ← OWNED（双写结束，target 成为正式 owner）
 	log.Printf("[migrate] Phase 4: shard=%d target=%d ← OWNED", shardID, targetGID)
-	if _, err := tgt.SetShardState(ctx, &pb.SetShardStateRequest{
+	if err := setRemoteShardState(ctx, tgt, &pb.SetShardStateRequest{
 		ShardId: int32(shardID), State: pb.ShardState_OWNED, TopologyEpoch: nextEpoch,
 	}); err != nil {
-		return fmt.Errorf("phase 4 target.OWNED failed: %w", err)
+		rollbackErr := m.rollbackOnlineMigration(src, tgt, shardID, sourceOriginal, targetOriginal, phase1Done, phase2Done, copied)
+		return combineMigrationErrors(fmt.Errorf("phase 4 target.OWNED failed: %w", err), rollbackErr)
 	}
 	nextEpoch++
 
 	// Phase 5: Source ← ABSENT（停止服务该 shard）
 	log.Printf("[migrate] Phase 5: shard=%d source=%d ← ABSENT", shardID, sourceGID)
-	if _, err := src.SetShardState(ctx, &pb.SetShardStateRequest{
+	if err := setRemoteShardState(ctx, src, &pb.SetShardStateRequest{
 		ShardId: int32(shardID), State: pb.ShardState_ABSENT, TopologyEpoch: nextEpoch,
 	}); err != nil {
-		return fmt.Errorf("phase 5 source.ABSENT failed: %w", err)
+		rollbackErr := m.rollbackOnlineMigration(src, tgt, shardID, sourceOriginal, targetOriginal, phase1Done, phase2Done, copied)
+		return combineMigrationErrors(fmt.Errorf("phase 5 source.ABSENT failed: %w", err), rollbackErr)
 	}
 	nextEpoch++
 
 	// Phase 6: 清理源数据
 	log.Printf("[migrate] Phase 6: shard=%d clean source=%d data", shardID, sourceGID)
-	if err := m.cleanShardData(ctx, shardID, sourceGID, prefix); err != nil {
-		log.Printf("[migrate] Phase 6 warning: clean source data failed: %v (data will be orphaned)", err)
+	if err := m.cleanShardData(ctx, src, shardID, sourceGID, prefix); err != nil {
+		// At this point target owns the shard and source is ABSENT. Do not
+		// roll back copied data after a partial cleanup: some source keys may
+		// already have been deleted and restoring the old ownership could hide
+		// data that was intentionally moved. Report the cleanup failure for
+		// retry instead.
+		return fmt.Errorf("phase 6 clean source data failed: %w", err)
+	}
+	// Keep the source router's in-memory ownership table in sync when the
+	// target group is already part of its configured topology.
+	if containsGroupID(m.source.GroupIDs(), targetGID) && !m.source.topology.MoveShard(shardID, targetGID) {
+		return fmt.Errorf("update source topology ownership failed for shard %d", shardID)
 	}
 
 	log.Printf("[migrate] shard=%d migration complete: %d → %d", shardID, sourceGID, targetGID)
 	return nil
 }
 
+type onlineCopiedItem struct {
+	item   MigrationPlanItem
+	before *pb.GetResponse
+}
+
+type remoteShardState struct {
+	state       pb.ShardState
+	targetGroup int32
+}
+
+func setRemoteShardState(ctx context.Context, client pb.KVServiceClient, req *pb.SetShardStateRequest) error {
+	resp, err := client.SetShardState(ctx, req)
+	if err != nil {
+		return err
+	}
+	if resp.GetError() != "" {
+		return fmt.Errorf("set shard state: %s", resp.GetError())
+	}
+	return nil
+}
+
+func readRemoteShardState(ctx context.Context, client pb.KVServiceClient, shardID int) (remoteShardState, error) {
+	resp, err := client.GetShardStates(ctx, &pb.GetShardStatesRequest{})
+	if err != nil {
+		return remoteShardState{}, err
+	}
+	for _, entry := range resp.GetStates() {
+		if int(entry.GetShardId()) == shardID {
+			return remoteShardState{state: entry.GetState(), targetGroup: entry.GetTargetGroup()}, nil
+		}
+	}
+	return remoteShardState{}, fmt.Errorf("shard %d not found", shardID)
+}
+
+func restoreRemoteShardState(ctx context.Context, client pb.KVServiceClient, shardID int, original remoteShardState, epoch int64) error {
+	return setRemoteShardState(ctx, client, &pb.SetShardStateRequest{ShardId: int32(shardID), State: original.state, TargetGroup: original.targetGroup, TopologyEpoch: epoch})
+}
+
+func combineMigrationErrors(primary, rollback error) error {
+	if rollback == nil {
+		return primary
+	}
+	return fmt.Errorf("%v; rollback failed: %v", primary, rollback)
+}
+
+func (m *Migrator) rollbackOnlineMigration(src, tgt pb.KVServiceClient, shardID int, sourceOriginal, targetOriginal remoteShardState, phase1Done, phase2Done bool, copied []onlineCopiedItem) error {
+	var firstErr error
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := len(copied) - 1; i >= 0; i-- {
+		if err := m.rollbackTarget(rollbackCtx, copied[i].item, copied[i].before); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if phase2Done {
+		if err := restoreRemoteShardState(rollbackCtx, src, shardID, sourceOriginal, m.source.TopologyEpoch()+1); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if phase1Done {
+		if err := restoreRemoteShardState(rollbackCtx, tgt, shardID, targetOriginal, m.target.TopologyEpoch()+1); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func containsGroupID(groupIDs []int, wanted int) bool {
+	for _, gid := range groupIDs {
+		if gid == wanted {
+			return true
+		}
+	}
+	return false
+}
+
 // bulkCopyShard 从源 group 扫描属于指定 shard 的 key，批量写入目标 group。
 // 注意：使用单次全量扫描（limit=0），避免 BadgerDB Prefix 模式下游标分页的语义错误。
 // 对于超大规模数据集，可扩展为 Seek-based 的增量扫描。
-func (m *Migrator) bulkCopyShard(ctx context.Context, shardID, sourceGID, targetGID int, prefix string) error {
+func (m *Migrator) bulkCopyShard(ctx context.Context, shardID, sourceGID, targetGID int, prefix string) ([]onlineCopiedItem, error) {
 	totalCopied := 0
+	copied := make([]onlineCopiedItem, 0)
 	numShards := m.source.TopologyNumShards()
 
 	items, err := m.source.ScanGroup(ctx, sourceGID, "", 0)
 	if err != nil {
-		return fmt.Errorf("scan source failed: %w", err)
+		return copied, fmt.Errorf("scan source failed: %w", err)
 	}
 
 	for _, item := range items {
@@ -475,19 +590,47 @@ func (m *Migrator) bulkCopyShard(ctx context.Context, shardID, sourceGID, target
 		if prefix != "" && !strings.HasPrefix(key, prefix) {
 			continue
 		}
-		if _, err := m.target.PutToGroup(ctx, targetGID, key, item.GetValue(), item.GetVersion()); err != nil {
-			return fmt.Errorf("put to target failed key=%s: %w", key, err)
+		sourceItem := MigrationPlanItem{Key: key, Value: item.GetValue(), Version: item.GetVersion(), SourceGroup: sourceGID, TargetGroup: targetGID}
+		sourceBefore, err := m.fetchGroupValue(ctx, m.source, sourceGID, key)
+		if err != nil || sourceBefore.GetError() != "OK" || sourceBefore.GetValue() != sourceItem.Value {
+			if err == nil {
+				err = fmt.Errorf("source value changed for key %s", key)
+			}
+			return copied, err
 		}
+		targetBefore, err := m.fetchGroupValue(ctx, m.target, targetGID, key)
+		if err != nil {
+			return copied, err
+		}
+		if migrationValueEquals(targetBefore, sourceItem) {
+			continue
+		}
+		putVersion := migrationPutVersion(targetBefore)
+		if resp, putErr := m.target.PutToGroup(ctx, targetGID, key, item.GetValue(), putVersion); putErr != nil || !migrationPutAccepted(resp) {
+			if putErr != nil {
+				return copied, fmt.Errorf("put to target failed key=%s: %w", key, putErr)
+			}
+			return copied, fmt.Errorf("put to target failed key=%s: %s", key, resp.GetError())
+		}
+		after, verifyErr := m.fetchGroupValue(ctx, m.target, targetGID, key)
+		if verifyErr != nil || !migrationValueEquals(after, sourceItem) {
+			if verifyErr == nil {
+				verifyErr = fmt.Errorf("target verify failed for key %s", key)
+			}
+			return copied, verifyErr
+		}
+		copied = append(copied, onlineCopiedItem{item: sourceItem, before: targetBefore})
 		totalCopied++
 	}
 	log.Printf("[migrate] bulk copied %d keys for shard %d", totalCopied, shardID)
-	return nil
+	return copied, nil
 }
 
 // cleanShardData 清理源 group 中属于指定 shard 的数据。
 // 使用单次全量扫描（limit=0），避免 BadgerDB Prefix 模式下游标分页的语义错误。
-func (m *Migrator) cleanShardData(ctx context.Context, shardID, sourceGID int, prefix string) error {
+func (m *Migrator) cleanShardData(ctx context.Context, sourceClient pb.KVServiceClient, shardID, sourceGID int, prefix string) error {
 	totalDeleted := 0
+	var firstErr error
 	numShards := m.source.TopologyNumShards()
 
 	items, err := m.source.ScanGroup(ctx, sourceGID, "", 0)
@@ -495,6 +638,7 @@ func (m *Migrator) cleanShardData(ctx context.Context, shardID, sourceGID int, p
 		return err
 	}
 
+	keys := make([]*pb.CleanupShardKey, 0)
 	for _, item := range items {
 		if item == nil {
 			continue
@@ -506,14 +650,20 @@ func (m *Migrator) cleanShardData(ctx context.Context, shardID, sourceGID int, p
 		if prefix != "" && !strings.HasPrefix(key, prefix) {
 			continue
 		}
-		if _, err := m.source.DeleteFromGroup(ctx, sourceGID, key); err != nil {
-			log.Printf("[migrate] clean: delete %s failed: %v", key, err)
-			continue
+		keys = append(keys, &pb.CleanupShardKey{Key: key, ExpectedVersion: item.GetVersion()})
+	}
+	if len(keys) > 0 {
+		resp, err := sourceClient.CleanupShard(ctx, &pb.CleanupShardRequest{ShardId: int32(shardID), Keys: keys})
+		if err != nil {
+			firstErr = err
+		} else if resp.GetError() != "OK" {
+			firstErr = fmt.Errorf("cleanup source shard failed: %s", resp.GetError())
+		} else {
+			totalDeleted = int(resp.GetDeleted())
 		}
-		totalDeleted++
 	}
 	log.Printf("[migrate] cleaned %d keys from source group %d", totalDeleted, sourceGID)
-	return nil
+	return firstErr
 }
 
 // TopologyNumShards 返回 router 中 topology 的 shard 总数。

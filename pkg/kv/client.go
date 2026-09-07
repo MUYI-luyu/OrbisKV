@@ -13,7 +13,6 @@ import (
 // Clerk 是 KVraft 的分布式客户端。
 // 内部始终通过 ShardRouter 做路由——单 Raft 组自动退化为 1-group 路由。
 type Clerk struct {
-	servers     []string       // Raft RPC 地址（调试用）
 	router      *sharding.ShardRouter
 	coordinator *TxCoordinator // 2PC 事务协调器
 }
@@ -84,7 +83,7 @@ func MakeClerk(servers []string) *Clerk {
 	if err != nil {
 		panic(fmt.Sprintf("MakeClerk: %v", err))
 	}
-	return &Clerk{servers: servers, router: router, coordinator: NewTxCoordinator(router)}
+	return &Clerk{router: router, coordinator: NewTxCoordinator(router)}
 }
 
 // MakeShardedClerk 创建多 Group 分片 Clerk。

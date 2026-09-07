@@ -270,11 +270,17 @@ func TestTxHandleGetCachesToReadSet(t *testing.T) {
 	mock.kv["a"] = &pb.KeyValue{Key: "a", Value: "modified", Version: 2}
 	mock.mu.Unlock()
 
-	// 第二次 Get：ReadSet 已缓存，但会重新从 server 读取并更新
+	// 第二次 Get：ReadSet 已缓存，返回首次读取的快照
 	val, ver, _ := h.Get("a")
-	// 应返回最新值（会重新从 server 读）
-	if val != "modified" || ver != 2 {
-		t.Fatalf("第二次 Get 应返回 (modified, 2)，实际: (%s, %d)", val, ver)
+	if val != "val-a" || ver != 1 {
+		t.Fatalf("第二次 Get 应返回首次快照 (val-a, 1)，实际: (%s, %d)", val, ver)
+	}
+	mock.mu.Lock()
+	mock.kv["a"] = &pb.KeyValue{Key: "a", Value: "external", Version: 2}
+	mock.mu.Unlock()
+	h.Put("b", "transaction-write", 0)
+	if err := h.Commit(); err != ErrTxConflict {
+		t.Fatalf("首次读后发生外部更新时 Commit 应冲突，实际: %s", err)
 	}
 }
 

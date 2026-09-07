@@ -60,6 +60,26 @@ func NewShardTopology(numShards int, groups map[int][]string) *ShardTopology {
 }
 
 // shardForKey 计算 key 的 shard ID。
+// NewShardTopologyWithOwnership creates a topology from an explicit owner table.
+func NewShardTopologyWithOwnership(numShards int, groups map[int][]string, owners []int, epoch int64) *ShardTopology {
+	if numShards < 1 || len(groups) == 0 || len(owners) != numShards {
+		return nil
+	}
+	st := NewShardTopology(numShards, groups)
+	for _, gid := range owners {
+		if _, ok := groups[gid]; !ok {
+			return nil
+		}
+	}
+	st.mu.Lock()
+	st.shardToGroup = append([]int(nil), owners...)
+	st.mu.Unlock()
+	if epoch > 0 {
+		st.epoch.Store(epoch)
+	}
+	return st
+}
+
 func (st *ShardTopology) shardForKey(key string) int {
 	return int(xxhash.Sum64String(key) % uint64(st.numShards))
 }
@@ -95,6 +115,61 @@ func (st *ShardTopology) NumShards() int {
 }
 
 // GroupReplicas 返回 group 的副本 gRPC 地址列表。
+// Ownership returns a copy of the current shard owner table.
+func (st *ShardTopology) Ownership() []int {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	return append([]int(nil), st.shardToGroup...)
+}
+
+// GroupForShard returns the current owner of a shard.
+func (st *ShardTopology) GroupForShard(shard int) (int, bool) {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	if shard < 0 || shard >= len(st.shardToGroup) {
+		return 0, false
+	}
+	return st.shardToGroup[shard], true
+}
+
+// PlanAddGroup computes the post-expansion ownership and shards to migrate.
+func (st *ShardTopology) PlanAddGroup(gid int, replicas []string) ([]int, []int) {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	if _, exists := st.groups[gid]; exists || len(replicas) == 0 {
+		return nil, nil
+	}
+	owners := append([]int(nil), st.shardToGroup...)
+	counts := make(map[int]int, len(st.groups)+1)
+	for _, owner := range owners {
+		counts[owner]++
+	}
+	counts[gid] = 0
+	target := st.numShards / (len(st.groups) + 1)
+	ids := st.allGroupIDsLocked()
+	ids = append(ids, gid)
+	sort.Ints(ids)
+	moved := make([]int, 0)
+	for _, from := range ids {
+		if from == gid {
+			continue
+		}
+		for counts[from] > target && counts[gid] < target {
+			for shard := len(owners) - 1; shard >= 0; shard-- {
+				if owners[shard] != from {
+					continue
+				}
+				owners[shard] = gid
+				counts[from]--
+				counts[gid]++
+				moved = append(moved, shard)
+				break
+			}
+		}
+	}
+	return owners, moved
+}
+
 func (st *ShardTopology) GroupReplicas(gid int) []string {
 	st.mu.RLock()
 	defer st.mu.RUnlock()

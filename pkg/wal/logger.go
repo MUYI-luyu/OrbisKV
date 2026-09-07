@@ -15,18 +15,31 @@ import (
 
 // Entry 记录了已被 Raft 提交的状态机操作。
 type Entry struct {
-	RaftIndex int64    `json:"raft_index"`
-	Term      int      `json:"term"`
-	NodeID    int      `json:"node_id"`
-	ReqID     int64    `json:"req_id"`
-	OpType    string   `json:"op_type"`
-	Key       string   `json:"key,omitempty"`
-	Value     string   `json:"value,omitempty"`
-	Version   int64    `json:"version,omitempty"`
-	TTL       int64    `json:"ttl,omitempty"`
-	Keys      []string `json:"keys,omitempty"`
-	Cutoff    int64    `json:"cutoff,omitempty"`
-	Timestamp int64    `json:"timestamp"`
+	RaftIndex       int64    `json:"raft_index"`
+	Term            int      `json:"term"`
+	NodeID          int      `json:"node_id"`
+	ReqID           int64    `json:"req_id"`
+	OpType          string   `json:"op_type"`
+	Key             string   `json:"key,omitempty"`
+	Value           string   `json:"value,omitempty"`
+	Version         int64    `json:"version,omitempty"`
+	TTL             int64    `json:"ttl,omitempty"`
+	Keys            []string `json:"keys,omitempty"`
+	Versions        []int64  `json:"versions,omitempty"`
+	ShardID         int      `json:"shard_id,omitempty"`
+	ShardState      int32    `json:"shard_state,omitempty"`
+	TargetGroup     int      `json:"target_group,omitempty"`
+	Epoch           int64    `json:"epoch,omitempty"`
+	Replicas        []string `json:"replicas,omitempty"`
+	Cutoff          int64    `json:"cutoff,omitempty"`
+	TxReadKeys      []string `json:"tx_read_keys,omitempty"`
+	TxReadVersions  []int64  `json:"tx_read_versions,omitempty"`
+	TxWriteKeys     []string `json:"tx_write_keys,omitempty"`
+	TxWriteValues   []string `json:"tx_write_values,omitempty"`
+	TxWriteVersions []int64  `json:"tx_write_versions,omitempty"`
+	TxWriteDeletes  []bool   `json:"tx_write_deletes,omitempty"`
+	TxTimeoutMs     int64    `json:"tx_timeout_ms,omitempty"`
+	Timestamp       int64    `json:"timestamp"`
 }
 
 // WALRequest represents one append operation waiting for durable commit.

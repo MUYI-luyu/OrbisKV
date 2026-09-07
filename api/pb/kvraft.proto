@@ -23,6 +23,7 @@ service KVService {
   // 分片管理（迁移用）
   rpc SetShardState(SetShardStateRequest) returns (SetShardStateResponse);
   rpc GetShardStates(GetShardStatesRequest) returns (GetShardStatesResponse);
+  rpc CleanupShard(CleanupShardRequest) returns (CleanupShardResponse);
 
   // 2PC 分布式事务
   rpc PrepareTx(PrepareTxRequest) returns (PrepareTxResponse);
@@ -139,6 +140,7 @@ message SetShardStateRequest {
   ShardState state = 2;
   int32 target_group = 3;   // MIGRATING 时双写的目标 group
   int64 topology_epoch = 4; // 新的拓扑版本号
+  repeated string target_replicas = 5; // MIGRATING 时目标 group 的 gRPC 副本地址
 }
 
 message SetShardStateResponse {
@@ -158,6 +160,21 @@ message GetShardStatesResponse {
   int64 topology_epoch = 2;
 }
 
+message CleanupShardKey {
+  string key = 1;
+  int64 expected_version = 2;
+}
+
+message CleanupShardRequest {
+  int32 shard_id = 1;
+  repeated CleanupShardKey keys = 2;
+}
+
+message CleanupShardResponse {
+  string error = 1;
+  int32 deleted = 2;
+}
+
 // ============ 2PC 事务 ============
 
 message ReadKey {
@@ -169,6 +186,7 @@ message WriteKey {
   string key = 1;
   string value = 2;
   int64 version = 3;
+  bool is_delete = 4;
 }
 
 message PrepareTxRequest {

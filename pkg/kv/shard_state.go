@@ -16,17 +16,29 @@ import (
 
 // shardMeta 记录单个 shard 的本地状态。
 type shardMeta struct {
-	state       pb.ShardState // Owned / Migrating / Importing / Absent
-	targetGroup int           // MIGRATING 时双写转发的目标 group
+	state          pb.ShardState // Owned / Migrating / Importing / Absent
+	targetGroup    int           // MIGRATING 时双写转发的目标 group
+	targetReplicas []string      // 新 leader 建立双写连接所需的目标副本地址
+}
+
+type shardMetaSnapshot struct {
+	State          int32    `json:"state"`
+	TargetGroup    int      `json:"target_group"`
+	TargetReplicas []string `json:"target_replicas,omitempty"`
+}
+
+type shardStateSnapshot struct {
+	Epoch  int64                     `json:"epoch"`
+	States map[int]shardMetaSnapshot `json:"states"`
 }
 
 // shardStateManager 管理本节点上所有 shard 的状态。
 // 迁移协调器（Migrator）通过 gRPC 调用 SetShardState 修改状态。
 type shardStateManager struct {
-	mu       sync.RWMutex
-	states   map[int]shardMeta // shardID → meta
-	epoch    atomic.Int64      // 本节点已知的拓扑版本号
-	groupID  int               // 本节点所属 group
+	mu        sync.RWMutex
+	states    map[int]shardMeta // shardID → meta
+	epoch     atomic.Int64      // 本节点已知的拓扑版本号
+	groupID   int               // 本节点所属 group
 	numShards int
 
 	// 双写转发用的连接池：target group → gRPC client
@@ -52,9 +64,9 @@ func newShardStateManager(groupID, numShards int) *shardStateManager {
 }
 
 // SetShardState 修改 shard 状态。由迁移协调器通过 gRPC 调用。
-func (ssm *shardStateManager) SetShardState(shardID int, state pb.ShardState, targetGroup int, epoch int64) error {
-	if shardID < 0 || shardID >= ssm.numShards {
-		return fmt.Errorf("shard %d out of range [0,%d)", shardID, ssm.numShards)
+func (ssm *shardStateManager) SetShardState(shardID int, state pb.ShardState, targetGroup int, epoch int64, targetReplicas []string) error {
+	if err := ssm.validateShardID(shardID); err != nil {
+		return err
 	}
 
 	ssm.mu.Lock()
@@ -65,9 +77,20 @@ func (ssm *shardStateManager) SetShardState(shardID int, state pb.ShardState, ta
 		ssm.epoch.Store(epoch)
 	}
 
-	ssm.states[shardID] = shardMeta{state: state, targetGroup: targetGroup}
+	ssm.states[shardID] = shardMeta{
+		state:          state,
+		targetGroup:    targetGroup,
+		targetReplicas: append([]string(nil), targetReplicas...),
+	}
 	log.Printf("[shard-state] group=%d shard=%d state=%v targetGroup=%d epoch=%d",
 		ssm.groupID, shardID, state, targetGroup, epoch)
+	return nil
+}
+
+func (ssm *shardStateManager) validateShardID(shardID int) error {
+	if shardID < 0 || shardID >= ssm.numShards {
+		return fmt.Errorf("shard %d out of range [0,%d)", shardID, ssm.numShards)
+	}
 	return nil
 }
 
@@ -76,6 +99,7 @@ func (ssm *shardStateManager) GetShardState(shardID int) (shardMeta, bool) {
 	ssm.mu.RLock()
 	defer ssm.mu.RUnlock()
 	meta, ok := ssm.states[shardID]
+	meta.targetReplicas = append([]string(nil), meta.targetReplicas...)
 	return meta, ok
 }
 
@@ -90,9 +114,46 @@ func (ssm *shardStateManager) AllStates() map[int]shardMeta {
 	defer ssm.mu.RUnlock()
 	out := make(map[int]shardMeta, len(ssm.states))
 	for k, v := range ssm.states {
+		v.targetReplicas = append([]string(nil), v.targetReplicas...)
 		out[k] = v
 	}
 	return out
+}
+
+func (ssm *shardStateManager) Snapshot() shardStateSnapshot {
+	ssm.mu.RLock()
+	defer ssm.mu.RUnlock()
+	states := make(map[int]shardMetaSnapshot, len(ssm.states))
+	for shardID, meta := range ssm.states {
+		states[shardID] = shardMetaSnapshot{
+			State:          int32(meta.state),
+			TargetGroup:    meta.targetGroup,
+			TargetReplicas: append([]string(nil), meta.targetReplicas...),
+		}
+	}
+	return shardStateSnapshot{Epoch: ssm.epoch.Load(), States: states}
+}
+
+func (ssm *shardStateManager) Restore(snapshot shardStateSnapshot) error {
+	if len(snapshot.States) != ssm.numShards {
+		return fmt.Errorf("shard snapshot contains %d states, want %d", len(snapshot.States), ssm.numShards)
+	}
+	restored := make(map[int]shardMeta, ssm.numShards)
+	for shardID, meta := range snapshot.States {
+		if shardID < 0 || shardID >= ssm.numShards {
+			return fmt.Errorf("shard snapshot id %d out of range [0,%d)", shardID, ssm.numShards)
+		}
+		restored[shardID] = shardMeta{
+			state:          pb.ShardState(meta.State),
+			targetGroup:    meta.TargetGroup,
+			targetReplicas: append([]string(nil), meta.TargetReplicas...),
+		}
+	}
+	ssm.mu.Lock()
+	ssm.states = restored
+	ssm.epoch.Store(snapshot.Epoch)
+	ssm.mu.Unlock()
+	return nil
 }
 
 // ensureForwardClient 为目标 group 建立或复用 gRPC 连接。
@@ -128,7 +189,25 @@ func (ssm *shardStateManager) ensureForwardClient(targetGroup int, replicas []st
 func (ssm *shardStateManager) ForwardWrite(ctx context.Context, targetGroup int, key, value string, version int64) error {
 	ssm.mu.RLock()
 	client, ok := ssm.forwardClients[targetGroup]
+	var replicas []string
+	if !ok {
+		for shard := range ssm.states {
+			meta := ssm.states[shard]
+			if meta.targetGroup == targetGroup && meta.state == pb.ShardState_MIGRATING {
+				replicas = append([]string(nil), meta.targetReplicas...)
+				break
+			}
+		}
+	}
 	ssm.mu.RUnlock()
+	if !ok && len(replicas) > 0 {
+		var err error
+		client, err = ssm.ensureForwardClient(targetGroup, replicas)
+		if err != nil {
+			return err
+		}
+		ok = true
+	}
 	if !ok {
 		return fmt.Errorf("no forward client for group %d", targetGroup)
 	}
@@ -149,7 +228,25 @@ func (ssm *shardStateManager) ForwardWrite(ctx context.Context, targetGroup int,
 func (ssm *shardStateManager) ForwardDelete(ctx context.Context, targetGroup int, key string) error {
 	ssm.mu.RLock()
 	client, ok := ssm.forwardClients[targetGroup]
+	var replicas []string
+	if !ok {
+		for shard := range ssm.states {
+			meta := ssm.states[shard]
+			if meta.targetGroup == targetGroup && meta.state == pb.ShardState_MIGRATING {
+				replicas = append([]string(nil), meta.targetReplicas...)
+				break
+			}
+		}
+	}
 	ssm.mu.RUnlock()
+	if !ok && len(replicas) > 0 {
+		var err error
+		client, err = ssm.ensureForwardClient(targetGroup, replicas)
+		if err != nil {
+			return err
+		}
+		ok = true
+	}
 	if !ok {
 		return fmt.Errorf("no forward client for group %d", targetGroup)
 	}

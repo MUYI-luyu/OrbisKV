@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"errors"
+	"log"
 	"math/rand"
 	"net/rpc"
 	"os"
@@ -89,16 +90,16 @@ type persistedCommandEnvelope struct {
 // 实现单个 Raft 节点的 Go 对象。
 type Raft struct {
 	mu        sync.RWMutex // 锁，用于保护该节点状态的并发访问
-	peers     []string   // 所有节点的 RPC 端点
-	persister Persister  // 用于保存该节点持久化状态的对象
-	me        int        // 当前节点在 peers[] 中的索引
-	dead      int32      // 由 Kill() 设置为已死亡
+	peers     []string     // 所有节点的 RPC 端点
+	persister Persister    // 用于保存该节点持久化状态的对象
+	me        int          // 当前节点在 peers[] 中的索引
+	dead      int32        // 由 Kill() 设置为已死亡
 
-	Votes int
-	state int
+	Votes int // 当前选举的得票数
+	state int // 当前角色：Follower / Candidate / Leader
 
-	electionTimeout time.Duration
-	lastHeard       time.Time
+	electionTimeout time.Duration // 选举超时时长
+	lastHeard       time.Time     // 上次收到权威消息的时间
 
 	// 所有服务器上的持久化状态，在回复RPC之前更新持久化存储
 	CurrentTerm int
@@ -624,7 +625,7 @@ func (rf *Raft) commitPersistResult(stateLen int, logCount int, err error) {
 	defer rf.mu.Unlock()
 	if err != nil {
 		rf.invalidatePersistCacheLocked()
-		return
+		log.Fatalf("[raft-%d] persist failed, exiting: %v", rf.me, err)
 	}
 	if stateLen >= 0 {
 		rf.markPersistPersistedLocked(stateLen, logCount)
@@ -642,7 +643,7 @@ func (rf *Raft) persist(snapshot []byte) {
 	err := rf.waitPersistDone(done)
 	if err != nil {
 		rf.invalidatePersistCacheLocked()
-		return
+		log.Fatalf("[raft-%d] persist snapshot/state failed, exiting: %v", rf.me, err)
 	}
 	if stateLen >= 0 {
 		rf.markPersistPersistedLocked(stateLen, logCount)
@@ -653,6 +654,7 @@ func (rf *Raft) persistHardState() {
 	err := rf.waitPersistDone(rf.enqueuePersistHardStateLocked())
 	if err != nil {
 		rf.invalidatePersistCacheLocked()
+		log.Fatalf("[raft-%d] persist hardstate failed, exiting: %v", rf.me, err)
 	}
 }
 
@@ -980,7 +982,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.mu.Unlock()
 		err := rf.waitPersistDone(persistDone)
+		if err == nil && persistLogCount >= 0 {
+			rf.mu.Lock()
+			coveredIndex := rf.lastIncludedIndex + persistLogCount - 1
+			if coveredIndex > rf.persistedIndex {
+				rf.persistedIndex = coveredIndex
+				rf.commitCond.Signal()
+			}
+			rf.mu.Unlock()
+		}
 		if persistStateLen >= 0 || err != nil {
+			if err != nil && reply.Success {
+				reply.Success = false
+			}
 			rf.commitPersistResult(persistStateLen, persistLogCount, err)
 		}
 		return nil
@@ -1084,7 +1098,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		persistDone = rf.enqueuePersistHardStateLocked()
 	}
 
-	// // ---（第 8 步）更新 CommitIndex ---
+	// ---（第 8 步）更新 CommitIndex ---
 	if args.LeaderCommit > rf.CommitIndex {
 		// rf.CommitIndex = min(args.LeaderCommit, len(rf.log)-1)
 		rf.CommitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
@@ -1294,7 +1308,7 @@ func (rf *Raft) sendHeartbeats() {
 
 		go func(server int) {
 			rf.mu.Lock()
-			// 给 follower 安装快照
+			// Follower 需要的日志已经被 Leader 的快照截掉了，则给 follower 安装快照
 			if rf.nextIndex[server] <= rf.lastIncludedIndex {
 				snapshotData := rf.persister.ReadSnapshot()
 
@@ -1556,6 +1570,9 @@ func (rf *Raft) startElection() {
 	rf.persistHardState()
 	rf.Votes = 1
 	rf.resetElectionTimer()
+	if rf.Votes > len(rf.peers)/2 {
+		rf.becomeLeader()
+	}
 
 	args := &RequestVoteArgs{
 		Term:         rf.CurrentTerm,
@@ -1594,7 +1611,7 @@ func (rf *Raft) ticker() {
 			rf.startElection()
 		}
 
-		// 随机暂停 50~350 毫秒。
+		// 随机暂停 50~350 毫秒
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}

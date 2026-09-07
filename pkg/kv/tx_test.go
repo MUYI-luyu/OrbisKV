@@ -2,6 +2,7 @@ package kv
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -60,6 +61,122 @@ func getKey(t *testing.T, kv *KVServer, key string) (string, Tversion, bool) {
 		t.Fatalf("getKey %s 失败: %v", key, err)
 	}
 	return val, Tversion(ver), exists
+}
+
+func TestCleanupShardDeletesMatchingVersionsAtomically(t *testing.T) {
+	_, kv, cleanup := setupTestTxManager(t)
+	defer cleanup()
+
+	key := "cleanup-key"
+	seedKey(t, kv, key, "value", 3)
+	shardID := kv.shardForKey(key)
+	reply := kv.doCleanupShard(&CleanupShardArgs{ShardID: shardID, Keys: []CleanupShardKey{{Key: key, ExpectedVersion: 3}}})
+	if reply.Err != OK || reply.Deleted != 1 {
+		t.Fatalf("cleanup failed: %+v", reply)
+	}
+	if _, _, exists := getKey(t, kv, key); exists {
+		t.Fatal("cleanup key still exists")
+	}
+}
+
+func TestCleanupShardVersionConflictKeepsBatch(t *testing.T) {
+	_, kv, cleanup := setupTestTxManager(t)
+	defer cleanup()
+
+	key1 := "cleanup-a"
+	shardID := kv.shardForKey(key1)
+	key2 := ""
+	for i := 0; i < 10000; i++ {
+		candidate := fmt.Sprintf("cleanup-b-%d", i)
+		if kv.shardForKey(candidate) == shardID {
+			key2 = candidate
+			break
+		}
+	}
+	if key2 == "" {
+		t.Fatal("failed to find second key in shard")
+	}
+	seedKey(t, kv, key1, "a", 2)
+	seedKey(t, kv, key2, "b", 4)
+	reply := kv.doCleanupShard(&CleanupShardArgs{ShardID: shardID, Keys: []CleanupShardKey{
+		{Key: key1, ExpectedVersion: 2},
+		{Key: key2, ExpectedVersion: 3},
+	}})
+	if reply.Err != ErrVersion {
+		t.Fatalf("want ErrVersion, got %+v", reply)
+	}
+	if _, _, exists := getKey(t, kv, key1); !exists {
+		t.Fatal("atomic cleanup deleted first key on later conflict")
+	}
+	if _, _, exists := getKey(t, kv, key2); !exists {
+		t.Fatal("conflicting key was deleted")
+	}
+}
+
+func TestCleanupShardRejectsKeyFromAnotherShard(t *testing.T) {
+	_, kv, cleanup := setupTestTxManager(t)
+	defer cleanup()
+
+	key := "cleanup-wrong-shard"
+	seedKey(t, kv, key, "value", 1)
+	wrongShardID := (kv.shardForKey(key) + 1) % 1024
+	reply := kv.doCleanupShard(&CleanupShardArgs{ShardID: wrongShardID, Keys: []CleanupShardKey{{Key: key, ExpectedVersion: 1}}})
+	if reply.Err != ErrWrongGroup {
+		t.Fatalf("want ErrWrongGroup, got %+v", reply)
+	}
+	if _, _, exists := getKey(t, kv, key); !exists {
+		t.Fatal("cleanup deleted a key outside the requested shard")
+	}
+}
+
+func TestCleanupShardWALRoundTrip(t *testing.T) {
+	want := &CleanupShardArgs{ShardID: 37, Keys: []CleanupShardKey{
+		{Key: "cleanup-wal-a", ExpectedVersion: 4},
+		{Key: "cleanup-wal-b", ExpectedVersion: 9},
+	}}
+	entry := walEntryFromOp(2, 11, 3, Op{Me: 2, Id: 7, Req: want})
+	gotReq, mutates, err := walEntryToRequest(entry)
+	if err != nil {
+		t.Fatalf("WAL round trip failed: %v", err)
+	}
+	if !mutates {
+		t.Fatal("cleanup WAL entry must be replayed as a mutation")
+	}
+	got, ok := gotReq.(*CleanupShardArgs)
+	if !ok {
+		t.Fatalf("unexpected WAL request type %T", gotReq)
+	}
+	if got.ShardID != want.ShardID || len(got.Keys) != len(want.Keys) {
+		t.Fatalf("cleanup WAL metadata changed: got %+v want %+v", got, want)
+	}
+	for i := range want.Keys {
+		if got.Keys[i] != want.Keys[i] {
+			t.Fatalf("cleanup WAL key %d changed: got %+v want %+v", i, got.Keys[i], want.Keys[i])
+		}
+	}
+}
+
+func TestTxWALRoundTripPreservesTransactionPayload(t *testing.T) {
+	wantPrepare := &PrepareTxArgs{TxID: "wal-tx", ReadKeys: []ReadKey{{Key: "read", ExpectedVersion: 4}}, WriteKeys: []WriteKey{{Key: "put", Value: "v", Version: 2}, {Key: "del", Version: 7, IsDelete: true}}, TimeoutMs: 1234}
+	prepEntry := walEntryFromOp(1, 3, 2, Op{Req: wantPrepare})
+	gotReq, mutates, err := walEntryToRequest(prepEntry)
+	if err != nil || !mutates {
+		t.Fatalf("prepare WAL decode failed: mutates=%v err=%v", mutates, err)
+	}
+	gotPrepare, ok := gotReq.(*PrepareTxArgs)
+	if !ok || gotPrepare.TxID != wantPrepare.TxID || len(gotPrepare.ReadKeys) != 1 || len(gotPrepare.WriteKeys) != 2 || !gotPrepare.WriteKeys[1].IsDelete || gotPrepare.TimeoutMs != wantPrepare.TimeoutMs {
+		t.Fatalf("prepare WAL payload lost: %#v", gotReq)
+	}
+	wantCommit := &CommitTxArgs{TxID: "wal-tx", WriteKeys: wantPrepare.WriteKeys}
+	commitEntry := walEntryFromOp(1, 4, 2, Op{Req: wantCommit})
+	gotReq, mutates, err = walEntryToRequest(commitEntry)
+	if err != nil || !mutates {
+		t.Fatalf("commit WAL decode failed: mutates=%v err=%v", mutates, err)
+	}
+	gotCommit, ok := gotReq.(*CommitTxArgs)
+	if !ok || len(gotCommit.WriteKeys) != 2 || !gotCommit.WriteKeys[1].IsDelete {
+		t.Fatalf("commit WAL payload lost: %#v", gotReq)
+	}
 }
 
 // ========== Prepare 阶段测试 ==========
@@ -677,7 +794,7 @@ func TestResolveLockTimeoutAutoAbort(t *testing.T) {
 		ReadKeys:   nil,
 		WriteKeys:  []WriteKey{{Key: "a", Value: "new-a", Version: 1}},
 		PreparedAt: time.Now().UnixNano() - int64(10*time.Second), // 10 秒前
-		TimeoutMs:  1,                                               // 1ms 超时
+		TimeoutMs:  1,                                             // 1ms 超时
 	}
 	raw, _ := json.Marshal(rec)
 	kv.store.PutTxRecord("prepare:tx-timeout", raw)

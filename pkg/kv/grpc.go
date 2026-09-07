@@ -27,7 +27,7 @@ type grpcKVService struct {
 
 // SetShardState 实现 KVServiceServer。由迁移协调器调用来修改 shard 状态。
 func (s *grpcKVService) SetShardState(ctx context.Context, req *pb.SetShardStateRequest) (*pb.SetShardStateResponse, error) {
-	err := s.kv.SetShardState(int(req.GetShardId()), req.GetState(), int(req.GetTargetGroup()), req.GetTopologyEpoch(), nil)
+	err := s.kv.SetShardState(int(req.GetShardId()), req.GetState(), int(req.GetTargetGroup()), req.GetTopologyEpoch(), req.GetTargetReplicas())
 	if err != nil {
 		return &pb.SetShardStateResponse{Error: err.Error()}, nil
 	}
@@ -38,6 +38,28 @@ func (s *grpcKVService) SetShardState(ctx context.Context, req *pb.SetShardState
 func (s *grpcKVService) GetShardStates(ctx context.Context, req *pb.GetShardStatesRequest) (*pb.GetShardStatesResponse, error) {
 	entries, epoch := s.kv.GetShardStates()
 	return &pb.GetShardStatesResponse{States: entries, TopologyEpoch: epoch}, nil
+}
+
+func (s *grpcKVService) CleanupShard(ctx context.Context, req *pb.CleanupShardRequest) (*pb.CleanupShardResponse, error) {
+	meta, ok := s.kv.shardMgr.GetShardState(int(req.GetShardId()))
+	if !ok || meta.state != pb.ShardState_ABSENT {
+		return &pb.CleanupShardResponse{Error: errReply(ErrWrongGroup)}, nil
+	}
+	keys := make([]CleanupShardKey, 0, len(req.GetKeys()))
+	for _, key := range req.GetKeys() {
+		if key != nil {
+			keys = append(keys, CleanupShardKey{Key: key.GetKey(), ExpectedVersion: Tversion(key.GetExpectedVersion())})
+		}
+	}
+	err, ret := s.kv.rsm.Submit(&CleanupShardArgs{ShardID: int(req.GetShardId()), Keys: keys})
+	if err != OK {
+		return &pb.CleanupShardResponse{Error: errReply(err)}, nil
+	}
+	reply, ok := ret.(CleanupShardReply)
+	if !ok {
+		return &pb.CleanupShardResponse{Error: "ErrInternal"}, nil
+	}
+	return &pb.CleanupShardResponse{Error: errReply(reply.Err), Deleted: int32(reply.Deleted)}, nil
 }
 
 // 根据已有的 Raft RPC 地址，自动生成一个用于 gRPC 服务的监听地址
@@ -260,7 +282,7 @@ func convertWriteKeysFromProto(pbKeys []*pb.WriteKey) []WriteKey {
 	keys := make([]WriteKey, 0, len(pbKeys))
 	for _, k := range pbKeys {
 		if k != nil {
-			keys = append(keys, WriteKey{Key: k.GetKey(), Value: k.GetValue(), Version: Tversion(k.GetVersion())})
+			keys = append(keys, WriteKey{Key: k.GetKey(), Value: k.GetValue(), Version: Tversion(k.GetVersion()), IsDelete: k.GetIsDelete()})
 		}
 	}
 	return keys
@@ -273,7 +295,7 @@ func convertWriteKeysToProto(keys []WriteKey) []*pb.WriteKey {
 	}
 	pbKeys := make([]*pb.WriteKey, 0, len(keys))
 	for _, k := range keys {
-		pbKeys = append(pbKeys, &pb.WriteKey{Key: k.Key, Value: k.Value, Version: int64(k.Version)})
+		pbKeys = append(pbKeys, &pb.WriteKey{Key: k.Key, Value: k.Value, Version: int64(k.Version), IsDelete: k.IsDelete})
 	}
 	return pbKeys
 }

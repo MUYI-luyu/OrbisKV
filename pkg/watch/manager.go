@@ -272,7 +272,13 @@ func (m *Manager) cleanupExpired() {
 
 // GetStats 获取统计
 func (m *Manager) GetStats() Stats {
-	return *m.stats
+	return Stats{
+		TotalEvents:     atomic.LoadInt64(&m.stats.TotalEvents),
+		SuccessfulSends: atomic.LoadInt64(&m.stats.SuccessfulSends),
+		FailedSends:     atomic.LoadInt64(&m.stats.FailedSends),
+		DroppedEvents:   atomic.LoadInt64(&m.stats.DroppedEvents),
+		ActiveWatchers:  atomic.LoadInt64(&m.stats.ActiveWatchers),
+	}
 }
 
 // GetWatcherCount 获取订阅者数量

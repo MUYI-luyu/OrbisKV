@@ -43,6 +43,11 @@ import (
 //    将优先读取 data/cluster/runtime.env 里的:
 //      SHARDING_CONFIG      (source-config)
 //      SHARDING_NEXT_CONFIG (target-config)
+//
+// 6) 在线迁移指定 shard
+//    go run ./cmd/kvmigrate -online -shard 12 -source-group 1 -target-group 2 \
+//      -source-config ./data/cluster/sharding.json \
+//      -target-config ./data/cluster/sharding-next.json
 
 type jsonGroup struct {
 	GroupID   int      `json:"group_id"`
@@ -56,6 +61,9 @@ type jsonShardingConfig struct {
 	ConnectTimeoutMS  int         `json:"connect_timeout_ms"`
 	RequestTimeoutMS  int         `json:"request_timeout_ms"`
 	PreferredReplicas int         `json:"preferred_replicas"`
+	NumShards         int         `json:"num_shards"`
+	ShardToGroup      []int       `json:"shard_to_group,omitempty"`
+	TopologyEpoch     int64       `json:"topology_epoch,omitempty"`
 }
 
 func loadRuntimeMetadata() map[string]string {
@@ -93,6 +101,9 @@ func loadConfig(path string) (sharding.ShardingConfig, error) {
 	cfg := sharding.ShardingConfig{
 		VirtualNodeCount:  jc.VirtualNodeCount,
 		PreferredReplicas: jc.PreferredReplicas,
+		NumShards:         jc.NumShards,
+		ShardToGroup:      append([]int(nil), jc.ShardToGroup...),
+		TopologyEpoch:     jc.TopologyEpoch,
 	}
 	if jc.ConnectTimeoutMS > 0 {
 		cfg.ConnectTimeout = time.Duration(jc.ConnectTimeoutMS) * time.Millisecond
@@ -120,6 +131,13 @@ func main() {
 	dryRun := flag.Bool("dry-run", false, "only build and print migration plan")
 	deleteSource := flag.Bool("delete-source", false, "delete source keys after successful copy")
 	timeoutSec := flag.Int("timeout-sec", 30, "migration timeout in seconds")
+	online := flag.Bool("online", false, "use the existing online shard migration protocol")
+	shardID := flag.Int("shard", -1, "shard id for online migration")
+	sourceGroup := flag.Int("source-group", -1, "source group id for online migration")
+	targetGroup := flag.Int("target-group", -1, "target group id for online migration")
+	expandGroup := flag.Int("expand-group", -1, "add a group and migrate planned shards")
+	expandReplicas := flag.String("expand-replicas", "", "comma-separated gRPC replicas for the new group")
+	outputConfig := flag.String("output-config", "", "write the explicit post-expansion topology JSON")
 
 	flag.Parse()
 	meta := loadRuntimeMetadata()
@@ -143,6 +161,10 @@ func main() {
 		fmt.Println("  go run ./cmd/kvmigrate -source-config ./source.json -target-config ./target.json [-prefix p] [-limit n] [--dry-run] [--delete-source]")
 		fmt.Println("hint:")
 		fmt.Println("  直接执行时会优先读取 data/cluster/runtime.env 中的 SHARDING_CONFIG / SHARDING_NEXT_CONFIG")
+		os.Exit(2)
+	}
+	if *online && (*shardID < 0 || *sourceGroup < 0 || *targetGroup < 0) {
+		fmt.Fprintln(os.Stderr, "online migration requires -shard, -source-group and -target-group")
 		os.Exit(2)
 	}
 
@@ -174,7 +196,80 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeoutSec)*time.Second)
 	defer cancel()
 
+	if *expandGroup >= 0 {
+		if strings.TrimSpace(*expandReplicas) == "" || strings.TrimSpace(*outputConfig) == "" {
+			fmt.Fprintln(os.Stderr, "expansion requires -expand-replicas and -output-config")
+			os.Exit(2)
+		}
+		if containsGroup(sourceCfg, *expandGroup) {
+			fmt.Fprintf(os.Stderr, "group %d already exists\n", *expandGroup)
+			os.Exit(2)
+		}
+		replicas := strings.Split(*expandReplicas, ",")
+		for i := range replicas {
+			replicas[i] = strings.TrimSpace(replicas[i])
+		}
+		owners, moved := sourceRouter.PlanAddGroup(*expandGroup, replicas)
+		if len(owners) == 0 {
+			fmt.Fprintln(os.Stderr, "unable to plan expansion")
+			os.Exit(1)
+		}
+		expandedCfg := sourceCfg
+		expandedCfg.NumShards = sourceRouter.TopologyNumShards()
+		expandedCfg.Groups = append(append([]sharding.RaftGroupConfig(nil), sourceCfg.Groups...), sharding.RaftGroupConfig{GroupID: *expandGroup, Replicas: replicas})
+		expandedCfg.ShardToGroup = owners
+		expandedCfg.TopologyEpoch = sourceRouter.TopologyEpoch() + 1
+		expandedRouter, err := sharding.NewShardRouter(expandedCfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create expanded router failed: %v\n", err)
+			os.Exit(1)
+		}
+		defer expandedRouter.Close()
+		expander := sharding.NewMigrator(sourceRouter, expandedRouter)
+		for _, shard := range moved {
+			sourceGroup, ok := sourceRouter.GroupForShard(shard)
+			if !ok {
+				fmt.Fprintf(os.Stderr, "shard %d has no source group\n", shard)
+				os.Exit(1)
+			}
+			if err := expander.MigrateShardOnline(ctx, shard, sourceGroup, *expandGroup, *prefix); err != nil {
+				fmt.Fprintf(os.Stderr, "expand shard %d failed: %v\n", shard, err)
+				os.Exit(1)
+			}
+		}
+		if err := writeConfig(*outputConfig, expandedCfg); err != nil {
+			fmt.Fprintf(os.Stderr, "write expanded config failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("expansion done: group=%d moved_shards=%d config=%s\n", *expandGroup, len(moved), *outputConfig)
+		return
+	}
+
 	migrator := sharding.NewMigrator(sourceRouter, targetRouter)
+	if *online {
+		if *sourceGroup == *targetGroup {
+			fmt.Fprintln(os.Stderr, "online migration requires different source and target groups")
+			os.Exit(2)
+		}
+		if *shardID >= sourceRouter.TopologyNumShards() {
+			fmt.Fprintf(os.Stderr, "shard %d out of range [0,%d)\n", *shardID, sourceRouter.TopologyNumShards())
+			os.Exit(2)
+		}
+		if !containsGroup(sourceCfg, *sourceGroup) || !containsGroup(targetCfg, *targetGroup) {
+			fmt.Fprintln(os.Stderr, "source/target group is not present in the corresponding config")
+			os.Exit(2)
+		}
+		if *dryRun {
+			fmt.Printf("online migration dry-run: shard=%d source=%d target=%d\n", *shardID, *sourceGroup, *targetGroup)
+			return
+		}
+		if err := migrator.MigrateShardOnline(ctx, *shardID, *sourceGroup, *targetGroup, *prefix); err != nil {
+			fmt.Fprintf(os.Stderr, "online migration failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("online migration done")
+		return
+	}
 	plan, err := migrator.BuildPlan(ctx, *prefix, *limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "build migration plan failed: %v\n", err)
@@ -207,4 +302,25 @@ func main() {
 	}
 
 	fmt.Println("migration done")
+}
+
+func writeConfig(path string, cfg sharding.ShardingConfig) error {
+	groups := make([]jsonGroup, 0, len(cfg.Groups))
+	for _, g := range cfg.Groups {
+		groups = append(groups, jsonGroup{GroupID: g.GroupID, Replicas: append([]string(nil), g.Replicas...), LeaderIdx: g.LeaderIdx})
+	}
+	data, err := json.MarshalIndent(jsonShardingConfig{Groups: groups, VirtualNodeCount: cfg.VirtualNodeCount, ConnectTimeoutMS: int(cfg.ConnectTimeout / time.Millisecond), RequestTimeoutMS: int(cfg.RequestTimeout / time.Millisecond), PreferredReplicas: cfg.PreferredReplicas, NumShards: cfg.NumShards, ShardToGroup: cfg.ShardToGroup, TopologyEpoch: cfg.TopologyEpoch}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0644)
+}
+
+func containsGroup(cfg sharding.ShardingConfig, gid int) bool {
+	for _, group := range cfg.Groups {
+		if group.GroupID == gid {
+			return true
+		}
+	}
+	return false
 }
