@@ -179,10 +179,12 @@ type WriteKey struct {
 
 // PrepareTxArgs 是 Phase-1 请求：校验读集 + 获取写锁。
 type PrepareTxArgs struct {
-	TxID      string
-	ReadKeys  []ReadKey
-	WriteKeys []WriteKey
-	TimeoutMs int64
+	TxID                string
+	ReadKeys            []ReadKey
+	WriteKeys           []WriteKey
+	TimeoutMs           int64
+	CoordinatorGroupID  int
+	ParticipantGroupIDs []int
 }
 
 // PrepareTxReply 是 Phase-1 响应。
@@ -211,6 +213,14 @@ type AbortTxReply struct {
 	Err Err
 }
 
+type RecordTxDecisionArgs struct {
+	TxID                string
+	Decision            TxStatus
+	ParticipantGroupIDs []int
+}
+
+type RecordTxDecisionReply struct{ Err Err }
+
 // TxStatus 枚举事务可能的状态。
 type TxStatus int
 
@@ -228,8 +238,10 @@ type ResolveTxStatusArgs struct {
 
 // ResolveTxStatusReply 返回事务状态，如果已 prepare 则返回其 write keys。
 type ResolveTxStatusReply struct {
-	Status     TxStatus
-	PreparedAt int64
-	WriteKeys  []WriteKey
-	Err        Err
+	Status              TxStatus
+	PreparedAt          int64
+	WriteKeys           []WriteKey
+	Err                 Err
+	CoordinatorGroupID  int
+	ParticipantGroupIDs []int
 }

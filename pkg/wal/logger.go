@@ -39,6 +39,9 @@ type Entry struct {
 	TxWriteVersions []int64  `json:"tx_write_versions,omitempty"`
 	TxWriteDeletes  []bool   `json:"tx_write_deletes,omitempty"`
 	TxTimeoutMs     int64    `json:"tx_timeout_ms,omitempty"`
+	TxCoordinatorGroup int `json:"tx_coordinator_group,omitempty"`
+	TxParticipantGroups []int `json:"tx_participant_groups,omitempty"`
+	TxDecision int `json:"tx_decision,omitempty"`
 	Timestamp       int64    `json:"timestamp"`
 }
 

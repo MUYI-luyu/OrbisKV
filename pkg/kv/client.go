@@ -60,7 +60,6 @@ func (s *WatchSubscription) Cancel() {
 	}
 }
 
-
 // MakeClerk 创建单 Raft 组的 Clerk。内部使用 ShardRouter（1 group），
 // 所有方法走统一的分片路由路径，不再区分 classic/sharded 代码分支。
 func MakeClerk(servers []string) *Clerk {
@@ -96,6 +95,11 @@ func MakeShardedClerk(cfg sharding.ShardingConfig) (*Clerk, error) {
 }
 
 // Begin 开始一个分布式事务。
+// RecoverTransaction completes a prepared transaction from its durable coordinator decision.
+func (ck *Clerk) RecoverTransaction(txID string, participantGroupID int) Err {
+	return ck.coordinator.RecoverTransaction(txID, participantGroupID)
+}
+
 func (ck *Clerk) Begin() *TxHandle {
 	return ck.coordinator.Begin()
 }
@@ -200,8 +204,8 @@ func (ck *Clerk) readVersionFast(key string) Tversion {
 func (ck *Clerk) doPut(key string, value string, version Tversion, ttlSeconds int64) Err {
 	deadline := time.Now().Add(retryWindow)
 	attempts := 0
-	rpcAttempted := false    // 是否已发出过至少一次 RPC 调用
-	autoRefreshLeft := 3     // ErrVersion 自动刷新版本号的次数上限
+	rpcAttempted := false // 是否已发出过至少一次 RPC 调用
+	autoRefreshLeft := 3  // ErrVersion 自动刷新版本号的次数上限
 
 	for {
 		if attempts >= maxAttempts || time.Now().After(deadline) {

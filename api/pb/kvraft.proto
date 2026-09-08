@@ -194,6 +194,8 @@ message PrepareTxRequest {
   repeated ReadKey read_keys = 2;
   repeated WriteKey write_keys = 3;
   int64 timeout_ms = 4;
+  int32 coordinator_group_id = 5;
+  repeated int32 participant_group_ids = 6;
 }
 
 message PrepareTxResponse {
@@ -203,6 +205,8 @@ message PrepareTxResponse {
 message CommitTxRequest {
   string tx_id = 1;
   repeated WriteKey write_keys = 2;
+  bool decision_only = 3;
+  repeated int32 participant_group_ids = 4;
 }
 
 message CommitTxResponse {
@@ -211,6 +215,8 @@ message CommitTxResponse {
 
 message AbortTxRequest {
   string tx_id = 1;
+  bool decision_only = 2;
+  repeated int32 participant_group_ids = 3;
 }
 
 message AbortTxResponse {
@@ -222,8 +228,10 @@ message ResolveTxStatusRequest {
 }
 
 message ResolveTxStatusResponse {
-  string status = 1;         // "PREPARED", "COMMITTED", "ABORTED", "NOT_FOUND"
+  string status = 1;
   int64 prepared_at = 2;
   repeated WriteKey write_keys = 3;
   string error = 4;
+  int32 coordinator_group_id = 5;
+  repeated int32 participant_group_ids = 6;
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -142,15 +143,24 @@ func (h *TxHandle) Commit() Err {
 		h.mu.Unlock()
 		return ErrWrongGroup
 	}
-	allGroups := make([]int, 0, len(h.groups))
+	allGroups := make([]int, 0, len(h.groups)+len(readKeysByGroup))
+	seenGroups := make(map[int]bool)
 	for gid := range h.groups {
+		seenGroups[gid] = true
 		allGroups = append(allGroups, gid)
 	}
+	for gid := range readKeysByGroup {
+		if !seenGroups[gid] {
+			allGroups = append(allGroups, gid)
+		}
+	}
+	sort.Ints(allGroups)
 	h.mu.Unlock()
 
 	if len(allGroups) == 0 {
 		return OK // 空事务（仅有读操作）
 	}
+	coordinatorGroup := allGroups[0]
 
 	// Phase 1: 并行 Prepare
 	type prepareResult struct {
@@ -165,7 +175,7 @@ func (h *TxHandle) Commit() Err {
 				TxId:      h.txID,
 				ReadKeys:  readKeysToProto(readKeysByGroup[groupID]),
 				WriteKeys: writeKeysToProto(writeKeysByGroup[groupID]),
-				TimeoutMs: h.timeoutMs,
+				TimeoutMs: h.timeoutMs, CoordinatorGroupId: int32(coordinatorGroup), ParticipantGroupIds: int32Slice(allGroups),
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
@@ -189,8 +199,11 @@ func (h *TxHandle) Commit() Err {
 		prepared[result.gid] = true
 	}
 
-	// 如果有任何 Prepare 失败，回滚所有已 Prepare 的 Group
+	// Any terminal action must follow a durable coordinator decision.
 	if len(prepared) < len(allGroups) {
+		if h.persistDecision(coordinatorGroup, allGroups, TxStatusAborted) != OK {
+			return ErrTxTimeout
+		}
 		h.parallelAbort(prepared)
 		if firstErr != "" {
 			return firstErr
@@ -198,8 +211,11 @@ func (h *TxHandle) Commit() Err {
 		return ErrTxConflict
 	}
 
-	// Phase 2: 并行 Commit（带幂等重试）
-	return h.parallelCommit(writeKeysByGroup)
+	if h.persistDecision(coordinatorGroup, allGroups, TxStatusCommitted) != OK {
+		return ErrTxTimeout
+	}
+	// Phase 2: the durable COMMIT decision makes retries safe.
+	return h.parallelCommit(allGroups, writeKeysByGroup)
 }
 
 // parallelAbort 向所有给定 Group 发送 AbortTx（尽力而为）。
@@ -218,11 +234,12 @@ func (h *TxHandle) parallelAbort(groups map[int]bool) {
 }
 
 // parallelCommit 向所有给定 Group 发送 CommitTx，带幂等重试。
-func (h *TxHandle) parallelCommit(writeKeysByGroup map[int][]WriteKey) Err {
+func (h *TxHandle) parallelCommit(groups []int, writeKeysByGroup map[int][]WriteKey) Err {
 	var wg sync.WaitGroup
-	errCh := make(chan Err, len(writeKeysByGroup))
+	errCh := make(chan Err, len(groups))
 
-	for gid, wks := range writeKeysByGroup {
+	for _, gid := range groups {
+		wks := writeKeysByGroup[gid]
 		wg.Add(1)
 		go func(groupID int, writeKeys []WriteKey) {
 			defer wg.Done()
@@ -258,15 +275,109 @@ func (h *TxHandle) parallelCommit(writeKeysByGroup map[int][]WriteKey) Err {
 	return OK
 }
 
-// Rollback 向所有涉及的 Group 发送 AbortTx（尽力而为）。
+func (h *TxHandle) persistDecision(gid int, groups []int, decision TxStatus) Err {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ids := int32Slice(groups)
+	if decision == TxStatusCommitted {
+		resp, err := h.coordinator.router.CommitTxToGroup(ctx, gid, &pb.CommitTxRequest{TxId: h.txID, DecisionOnly: true, ParticipantGroupIds: ids})
+		if err == nil && resp != nil && resp.GetError() == string(OK) {
+			return OK
+		}
+	} else {
+		resp, err := h.coordinator.router.AbortTxToGroup(ctx, gid, &pb.AbortTxRequest{TxId: h.txID, DecisionOnly: true, ParticipantGroupIds: ids})
+		if err == nil && resp != nil && resp.GetError() == string(OK) {
+			return OK
+		}
+	}
+	return ErrTxTimeout
+}
+
+// RecoverTransaction resolves a prepared participant using the coordinator group's durable decision.
+func (tc *TxCoordinator) RecoverTransaction(txID string, participantGroupID int) Err {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	participant, err := tc.router.ResolveTxStatusToGroup(ctx, participantGroupID, &pb.ResolveTxStatusRequest{TxId: txID})
+	cancel()
+	if err != nil || participant == nil {
+		return ErrTxTimeout
+	}
+	if (participant.GetStatus() == "COMMITTED" || participant.GetStatus() == "ABORTED") && len(participant.GetParticipantGroupIds()) > 0 {
+		return recoverBroadcast(tc.router, txID, intsFromInt32(participant.GetParticipantGroupIds()), participant.GetStatus() == "COMMITTED")
+	}
+	if participant.GetStatus() != "PREPARED" {
+		return ErrTxTimeout
+	}
+	coordinator := int(participant.GetCoordinatorGroupId())
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	decision, err := tc.router.ResolveTxStatusToGroup(ctx, coordinator, &pb.ResolveTxStatusRequest{TxId: txID})
+	cancel()
+	if err != nil || decision == nil {
+		return ErrTxTimeout
+	}
+	groups := intsFromInt32(decision.GetParticipantGroupIds())
+	if len(groups) == 0 {
+		groups = intsFromInt32(participant.GetParticipantGroupIds())
+	}
+	if decision.GetStatus() == "COMMITTED" {
+		return recoverBroadcast(tc.router, txID, groups, true)
+	}
+	if decision.GetStatus() == "ABORTED" {
+		return recoverBroadcast(tc.router, txID, groups, false)
+	}
+	return ErrTxTimeout
+}
+
+func recoverBroadcast(router *sharding.ShardRouter, txID string, groups []int, commit bool) Err {
+	for _, gid := range groups {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		var err error
+		if commit {
+			var resp *pb.CommitTxResponse
+			resp, err = router.CommitTxToGroup(ctx, gid, &pb.CommitTxRequest{TxId: txID})
+			if err == nil && resp.GetError() != string(OK) {
+				err = fmt.Errorf("%s", resp.GetError())
+			}
+		} else {
+			var resp *pb.AbortTxResponse
+			resp, err = router.AbortTxToGroup(ctx, gid, &pb.AbortTxRequest{TxId: txID})
+			if err == nil && resp.GetError() != string(OK) {
+				err = fmt.Errorf("%s", resp.GetError())
+			}
+		}
+		cancel()
+		if err != nil {
+			return ErrTxTimeout
+		}
+	}
+	return OK
+}
+
+// Rollback durably records ABORT before notifying prepared participants.
 func (h *TxHandle) Rollback() {
 	h.mu.Lock()
-	groups := make(map[int]bool, len(h.groups))
+	groupSet := make(map[int]bool, len(h.groups)+len(h.readSet))
 	for gid := range h.groups {
-		groups[gid] = true
+		groupSet[gid] = true
+	}
+	for _, rk := range h.readSet {
+		if gid := h.coordinator.router.Resolve(rk.Key); gid >= 0 {
+			groupSet[gid] = true
+		}
+	}
+	groups := make([]int, 0, len(groupSet))
+	prepared := make(map[int]bool, len(groupSet))
+	for gid := range groupSet {
+		groups = append(groups, gid)
+		prepared[gid] = true
 	}
 	h.mu.Unlock()
-	h.parallelAbort(groups)
+	if len(groups) == 0 {
+		return
+	}
+	sort.Ints(groups)
+	if h.persistDecision(groups[0], groups, TxStatusAborted) == OK {
+		h.parallelAbort(prepared)
+	}
 }
 
 // groupWriteKeys 将 WriteSet 按 Group ID 分组。
@@ -338,4 +449,12 @@ func (tc *TxCoordinator) clerkGet(key string) (string, Tversion, int64, Err) {
 		return "", 0, 0, errCode
 	}
 	return resp.GetValue(), Tversion(resp.GetVersion()), resp.GetExpires(), OK
+}
+
+func int32Slice(in []int) []int32 {
+	out := make([]int32, len(in))
+	for i, v := range in {
+		out[i] = int32(v)
+	}
+	return out
 }

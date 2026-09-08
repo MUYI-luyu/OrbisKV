@@ -42,6 +42,7 @@ func StartKVServer(servers []string, gid int, me int, persister raft.Persister, 
 	gob.Register(CommitTxArgs{})
 	gob.Register(AbortTxArgs{})
 	gob.Register(ResolveTxStatusArgs{})
+	gob.Register(RecordTxDecisionArgs{})
 
 	storePath := filepath.Join(runtimeDataRoot(), "badger-"+address)
 	store, err := storage.NewStore(storePath)

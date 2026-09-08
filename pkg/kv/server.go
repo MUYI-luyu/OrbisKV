@@ -167,6 +167,8 @@ func (kv *KVServer) DoOp(req any) any {
 		return kv.txMgr.Abort(reqPtr[AbortTxArgs](req))
 	case *ResolveTxStatusArgs, ResolveTxStatusArgs:
 		return kv.txMgr.ResolveTxStatus(reqPtr[ResolveTxStatusArgs](req))
+	case *RecordTxDecisionArgs, RecordTxDecisionArgs:
+		return kv.txMgr.RecordDecision(reqPtr[RecordTxDecisionArgs](req))
 	default:
 		log.Printf("[KVServer-%d] Unknown request type: %T", kv.me, req)
 		return GetReply{Err: ErrWrongLeader}

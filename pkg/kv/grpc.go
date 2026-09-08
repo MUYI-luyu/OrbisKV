@@ -309,7 +309,7 @@ func (s *grpcKVService) PrepareTx(ctx context.Context, req *pb.PrepareTxRequest)
 		TxID:      req.GetTxId(),
 		ReadKeys:  convertReadKeysFromProto(req.GetReadKeys()),
 		WriteKeys: convertWriteKeysFromProto(req.GetWriteKeys()),
-		TimeoutMs: req.GetTimeoutMs(),
+		TimeoutMs: req.GetTimeoutMs(), CoordinatorGroupID: int(req.GetCoordinatorGroupId()), ParticipantGroupIDs: intsFromInt32(req.GetParticipantGroupIds()),
 	}
 	err, ret := s.kv.rsm.Submit(args)
 	if err != OK {
@@ -329,6 +329,17 @@ func (s *grpcKVService) CommitTx(ctx context.Context, req *pb.CommitTxRequest) (
 		return &pb.CommitTxResponse{Error: errReply(ErrWrongLeader)}, nil
 	}
 
+	if req.GetDecisionOnly() {
+		consErr, value := s.kv.rsm.Submit(&RecordTxDecisionArgs{TxID: req.GetTxId(), Decision: TxStatusCommitted, ParticipantGroupIDs: intsFromInt32(req.GetParticipantGroupIds())})
+		if consErr != OK {
+			return &pb.CommitTxResponse{Error: errReply(consErr)}, nil
+		}
+		reply, ok := value.(RecordTxDecisionReply)
+		if !ok {
+			return &pb.CommitTxResponse{Error: "ErrInternal"}, nil
+		}
+		return &pb.CommitTxResponse{Error: errReply(reply.Err)}, nil
+	}
 	args := &CommitTxArgs{
 		TxID:      req.GetTxId(),
 		WriteKeys: convertWriteKeysFromProto(req.GetWriteKeys()),
@@ -351,6 +362,17 @@ func (s *grpcKVService) AbortTx(ctx context.Context, req *pb.AbortTxRequest) (*p
 		return &pb.AbortTxResponse{Error: errReply(ErrWrongLeader)}, nil
 	}
 
+	if req.GetDecisionOnly() {
+		consErr, value := s.kv.rsm.Submit(&RecordTxDecisionArgs{TxID: req.GetTxId(), Decision: TxStatusAborted, ParticipantGroupIDs: intsFromInt32(req.GetParticipantGroupIds())})
+		if consErr != OK {
+			return &pb.AbortTxResponse{Error: errReply(consErr)}, nil
+		}
+		reply, ok := value.(RecordTxDecisionReply)
+		if !ok {
+			return &pb.AbortTxResponse{Error: "ErrInternal"}, nil
+		}
+		return &pb.AbortTxResponse{Error: errReply(reply.Err)}, nil
+	}
 	args := &AbortTxArgs{TxID: req.GetTxId()}
 	err, ret := s.kv.rsm.Submit(args)
 	if err != OK {
@@ -393,10 +415,9 @@ func (s *grpcKVService) ResolveTxStatus(ctx context.Context, req *pb.ResolveTxSt
 	}
 
 	return &pb.ResolveTxStatusResponse{
-		Status:     statusStr,
-		PreparedAt: reply.PreparedAt,
-		WriteKeys:  convertWriteKeysToProto(reply.WriteKeys),
-		Error:      errReply(reply.Err),
+		Status: statusStr, PreparedAt: reply.PreparedAt,
+		WriteKeys: convertWriteKeysToProto(reply.WriteKeys), Error: errReply(reply.Err),
+		CoordinatorGroupId: int32(reply.CoordinatorGroupID), ParticipantGroupIds: int32Slice(reply.ParticipantGroupIDs),
 	}, nil
 }
 
@@ -456,4 +477,12 @@ func StartGRPCServer(kv *KVServer, rpcAddr string) (*grpc.Server, net.Listener) 
 	kv.grpcSrv = gs
 	kv.grpcLn = lis
 	return gs, lis
+}
+
+func intsFromInt32(in []int32) []int {
+	out := make([]int, len(in))
+	for i, v := range in {
+		out[i] = int(v)
+	}
+	return out
 }

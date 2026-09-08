@@ -15,15 +15,18 @@ const (
 	txPreparePrefix  = "prepare:"
 	txCommitPrefix   = "commit:"
 	txAbortPrefix    = "abort:"
+	txDecisionPrefix = "decision:"
 )
 
 // preparedTxRecord 是 _tx:prepare:{txID} 的磁盘存储格式。
 type preparedTxRecord struct {
-	TxID       string     `json:"tx_id"`
-	ReadKeys   []ReadKey  `json:"read_keys"`
-	WriteKeys  []WriteKey `json:"write_keys"`
-	PreparedAt int64      `json:"prepared_at"`
-	TimeoutMs  int64      `json:"timeout_ms"`
+	TxID                string     `json:"tx_id"`
+	ReadKeys            []ReadKey  `json:"read_keys"`
+	WriteKeys           []WriteKey `json:"write_keys"`
+	PreparedAt          int64      `json:"prepared_at"`
+	TimeoutMs           int64      `json:"timeout_ms"`
+	CoordinatorGroupID  int        `json:"coordinator_group_id"`
+	ParticipantGroupIDs []int      `json:"participant_group_ids"`
 }
 
 // TxManager 管理单个 Raft Group 内的 2PC 参与者状态。
@@ -77,16 +80,10 @@ func (tm *TxManager) RebuildLockTable() error {
 			continue
 		}
 
-		// 检查超时
-		if rec.TimeoutMs > 0 {
-			deadline := rec.PreparedAt + rec.TimeoutMs*int64(time.Millisecond)
-			if time.Now().UnixNano() > deadline {
-				// 已超时 — 自动回滚并清理
-				abortRecord := []byte("1")
-				_ = tm.kv.store.PutTxRecord(txAbortPrefix+rec.TxID, abortRecord)
-				_ = tm.kv.store.DeleteTxRecord(txPreparePrefix + rec.TxID)
-				continue
-			}
+		if len(rec.ParticipantGroupIDs) == 0 && rec.TimeoutMs > 0 && time.Now().UnixNano() > rec.PreparedAt+rec.TimeoutMs*int64(time.Millisecond) {
+			_ = tm.kv.store.PutTxRecord(txAbortPrefix+rec.TxID, []byte("1"))
+			_ = tm.kv.store.DeleteTxRecord(txPreparePrefix + rec.TxID)
+			continue
 		}
 
 		// 有效的 prepare 事务 — 重建锁
@@ -161,11 +158,13 @@ func (tm *TxManager) Prepare(args *PrepareTxArgs) PrepareTxReply {
 		timeoutMs = int64(txDefaultTimeout / time.Millisecond)
 	}
 	rec := preparedTxRecord{
-		TxID:       args.TxID,
-		ReadKeys:   args.ReadKeys,
-		WriteKeys:  args.WriteKeys,
-		PreparedAt: now,
-		TimeoutMs:  timeoutMs,
+		TxID:                args.TxID,
+		ReadKeys:            args.ReadKeys,
+		WriteKeys:           args.WriteKeys,
+		PreparedAt:          now,
+		TimeoutMs:           timeoutMs,
+		CoordinatorGroupID:  args.CoordinatorGroupID,
+		ParticipantGroupIDs: append([]int(nil), args.ParticipantGroupIDs...),
 	}
 	raw, err := json.Marshal(rec)
 	if err != nil {
@@ -190,6 +189,30 @@ func (tm *TxManager) Prepare(args *PrepareTxArgs) PrepareTxReply {
 	return PrepareTxReply{Err: OK}
 }
 
+type txDecisionRecord struct {
+	Decision            TxStatus `json:"decision"`
+	ParticipantGroupIDs []int    `json:"participant_group_ids"`
+}
+
+func (tm *TxManager) RecordDecision(args *RecordTxDecisionArgs) RecordTxDecisionReply {
+	if args.Decision != TxStatusCommitted && args.Decision != TxStatusAborted {
+		return RecordTxDecisionReply{Err: ErrTxConflict}
+	}
+	key := txDecisionPrefix + args.TxID
+	if raw, found, _ := tm.kv.store.GetTxRecord(key); found {
+		var existing txDecisionRecord
+		if json.Unmarshal(raw, &existing) == nil && existing.Decision == args.Decision {
+			return RecordTxDecisionReply{Err: OK}
+		}
+		return RecordTxDecisionReply{Err: ErrTxConflict}
+	}
+	raw, err := json.Marshal(txDecisionRecord{Decision: args.Decision, ParticipantGroupIDs: append([]int(nil), args.ParticipantGroupIDs...)})
+	if err != nil || tm.kv.store.PutTxRecord(key, raw) != nil {
+		return RecordTxDecisionReply{Err: ErrWrongLeader}
+	}
+	return RecordTxDecisionReply{Err: OK}
+}
+
 // Commit 执行 2PC 的 Phase 2：
 //  1. 幂等检查：commit 或 abort 记录是否已存在
 //  2. WriteBatchWithCASAndRecord 在单个 BadgerDB txn 中原子执行：
@@ -208,8 +231,22 @@ func (tm *TxManager) Commit(args *CommitTxArgs) CommitTxReply {
 		return CommitTxReply{Err: ErrTxConflict} // 已回滚
 	}
 
-	// 检查是否有 prepare 记录
-	_, prepared := tm.preparedTxs[args.TxID]
+	if raw, found, _ := tm.kv.store.GetTxRecord(txPreparePrefix + args.TxID); found {
+		var pending preparedTxRecord
+		if json.Unmarshal(raw, &pending) == nil && len(pending.ParticipantGroupIDs) > 0 && tm.kv.groupID == pending.CoordinatorGroupID {
+			if decision, ok, _ := tm.kv.store.GetTxRecord(txDecisionPrefix + args.TxID); !ok {
+				return CommitTxReply{Err: ErrTxConflict}
+			} else {
+				var d txDecisionRecord
+				if json.Unmarshal(decision, &d) != nil || d.Decision != TxStatusCommitted {
+					return CommitTxReply{Err: ErrTxConflict}
+				}
+			}
+		}
+	}
+
+	// Use the durable Prepare write set; never trust a different phase-2 payload.
+	rec, prepared := tm.preparedTxs[args.TxID]
 	tm.mu.Unlock()
 
 	if !prepared {
@@ -218,13 +255,14 @@ func (tm *TxManager) Commit(args *CommitTxArgs) CommitTxReply {
 		if !found {
 			return CommitTxReply{Err: ErrTxNotFound}
 		}
-		var rec preparedTxRecord
-		if err := json.Unmarshal(raw, &rec); err != nil {
+		var diskRec preparedTxRecord
+		if err := json.Unmarshal(raw, &diskRec); err != nil {
 			return CommitTxReply{Err: ErrTxNotFound}
 		}
 		// 重新加载到缓存并重建锁
 		tm.mu.Lock()
-		tm.preparedTxs[args.TxID] = &rec
+		rec = &diskRec
+		tm.preparedTxs[args.TxID] = rec
 		for _, wk := range rec.WriteKeys {
 			tm.lockTable[wk.Key] = rec.TxID
 		}
@@ -232,8 +270,8 @@ func (tm *TxManager) Commit(args *CommitTxArgs) CommitTxReply {
 	}
 
 	// 2. 构建 WriteBatchOps
-	ops := make([]storage.WriteBatchOp, 0, len(args.WriteKeys))
-	for _, wk := range args.WriteKeys {
+	ops := make([]storage.WriteBatchOp, 0, len(rec.WriteKeys))
+	for _, wk := range rec.WriteKeys {
 		ops = append(ops, storage.WriteBatchOp{
 			Key:             wk.Key,
 			Value:           wk.Value,
@@ -254,7 +292,7 @@ func (tm *TxManager) Commit(args *CommitTxArgs) CommitTxReply {
 
 	// 4. 释放锁并清理
 	tm.mu.Lock()
-	for _, wk := range args.WriteKeys {
+	for _, wk := range rec.WriteKeys {
 		delete(tm.lockTable, wk.Key)
 	}
 	delete(tm.preparedTxs, args.TxID)
@@ -314,6 +352,12 @@ func (tm *TxManager) Abort(args *AbortTxArgs) AbortTxReply {
 // ResolveTxStatus 返回事务的当前状态。
 // 按顺序检查：commit → abort → prepare → not found。
 func (tm *TxManager) ResolveTxStatus(args *ResolveTxStatusArgs) ResolveTxStatusReply {
+	if raw, found, _ := tm.kv.store.GetTxRecord(txDecisionPrefix + args.TxID); found {
+		var d txDecisionRecord
+		if json.Unmarshal(raw, &d) == nil {
+			return ResolveTxStatusReply{Status: d.Decision, ParticipantGroupIDs: d.ParticipantGroupIDs, Err: OK}
+		}
+	}
 	// 检查 commit
 	if commitData, found, _ := tm.kv.store.GetTxRecord(txCommitPrefix + args.TxID); found {
 		_ = commitData
@@ -331,29 +375,24 @@ func (tm *TxManager) ResolveTxStatus(args *ResolveTxStatusArgs) ResolveTxStatusR
 		if err := json.Unmarshal(raw, &rec); err != nil {
 			return ResolveTxStatusReply{Status: TxStatusNotFound, Err: ErrTxNotFound}
 		}
-		// 检查超时
-		if rec.TimeoutMs > 0 {
-			deadline := rec.PreparedAt + rec.TimeoutMs*int64(time.Millisecond)
-			if time.Now().UnixNano() > deadline {
-				// 已超时 — 内联自动回滚
-				tm.mu.Lock()
-				for _, wk := range rec.WriteKeys {
-					if holder, exists := tm.lockTable[wk.Key]; exists && holder == args.TxID {
-						delete(tm.lockTable, wk.Key)
-					}
-				}
-				delete(tm.preparedTxs, args.TxID)
-				tm.mu.Unlock()
-				_ = tm.kv.store.PutTxRecord(txAbortPrefix+args.TxID, []byte("1"))
-				_ = tm.kv.store.DeleteTxRecord(txPreparePrefix + args.TxID)
-				return ResolveTxStatusReply{Status: TxStatusAborted, Err: OK}
-			}
+
+		if len(rec.ParticipantGroupIDs) == 0 && rec.TimeoutMs > 0 && time.Now().UnixNano() > rec.PreparedAt+rec.TimeoutMs*int64(time.Millisecond) {
+			tm.mu.Lock()
+			tm.releaseLocksForTxLocked(args.TxID)
+			delete(tm.preparedTxs, args.TxID)
+			tm.mu.Unlock()
+			_ = tm.kv.store.PutTxRecord(txAbortPrefix+args.TxID, []byte("1"))
+			_ = tm.kv.store.DeleteTxRecord(txPreparePrefix + args.TxID)
+			return ResolveTxStatusReply{Status: TxStatusAborted, Err: OK}
 		}
+
 		return ResolveTxStatusReply{
-			Status:     TxStatusPrepared,
-			PreparedAt: rec.PreparedAt,
-			WriteKeys:  rec.WriteKeys,
-			Err:        OK,
+			Status:              TxStatusPrepared,
+			PreparedAt:          rec.PreparedAt,
+			WriteKeys:           rec.WriteKeys,
+			Err:                 OK,
+			CoordinatorGroupID:  rec.CoordinatorGroupID,
+			ParticipantGroupIDs: append([]int(nil), rec.ParticipantGroupIDs...),
 		}
 	}
 
@@ -394,17 +433,12 @@ func (tm *TxManager) resolveLockLocked(txID string) bool {
 		}
 	}
 
-	// 检查 prepare 超时
-	if rec.TimeoutMs > 0 {
-		deadline := rec.PreparedAt + rec.TimeoutMs*int64(time.Millisecond)
-		if time.Now().UnixNano() > deadline {
-			// 已超时 — 自动回滚
-			tm.releaseLocksForTxLocked(txID)
-			delete(tm.preparedTxs, txID)
-			_ = tm.kv.store.PutTxRecord(txAbortPrefix+txID, []byte("1"))
-			_ = tm.kv.store.DeleteTxRecord(txPreparePrefix + txID)
-			return true
-		}
+	if len(rec.ParticipantGroupIDs) == 0 && rec.TimeoutMs > 0 && time.Now().UnixNano() > rec.PreparedAt+rec.TimeoutMs*int64(time.Millisecond) {
+		tm.releaseLocksForTxLocked(txID)
+		delete(tm.preparedTxs, txID)
+		_ = tm.kv.store.PutTxRecord(txAbortPrefix+txID, []byte("1"))
+		_ = tm.kv.store.DeleteTxRecord(txPreparePrefix + txID)
+		return true
 	}
 
 	// 仍然是有效的 prepare 事务 — 锁未被释放

@@ -24,6 +24,7 @@ type mockTxService struct {
 	prepared   map[string]*pb.PrepareTxRequest
 	committed  map[string]bool
 	aborted    map[string]bool
+	decisions  map[string]bool
 	conflictOn string // 对此 txID 返回冲突
 }
 
@@ -33,6 +34,7 @@ func newMockTxService() *mockTxService {
 		prepared:  make(map[string]*pb.PrepareTxRequest),
 		committed: make(map[string]bool),
 		aborted:   make(map[string]bool),
+		decisions: make(map[string]bool),
 	}
 }
 
@@ -107,6 +109,10 @@ func (s *mockTxService) PrepareTx(_ context.Context, req *pb.PrepareTxRequest) (
 func (s *mockTxService) CommitTx(_ context.Context, req *pb.CommitTxRequest) (*pb.CommitTxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if req.GetDecisionOnly() {
+		s.decisions[req.GetTxId()] = true
+		return &pb.CommitTxResponse{Error: "OK"}, nil
+	}
 
 	if s.committed[req.GetTxId()] {
 		return &pb.CommitTxResponse{Error: "OK"}, nil // 幂等
@@ -134,6 +140,10 @@ func (s *mockTxService) CommitTx(_ context.Context, req *pb.CommitTxRequest) (*p
 func (s *mockTxService) AbortTx(_ context.Context, req *pb.AbortTxRequest) (*pb.AbortTxResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if req.GetDecisionOnly() {
+		s.aborted[req.GetTxId()] = true
+		return &pb.AbortTxResponse{Error: "OK"}, nil
+	}
 
 	if s.committed[req.GetTxId()] {
 		return &pb.AbortTxResponse{Error: "ErrTxConflict"}, nil
@@ -145,7 +155,6 @@ func (s *mockTxService) AbortTx(_ context.Context, req *pb.AbortTxRequest) (*pb.
 
 func (s *mockTxService) ResolveTxStatus(_ context.Context, req *pb.ResolveTxStatusRequest) (*pb.ResolveTxStatusResponse, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if s.committed[req.GetTxId()] {
 		return &pb.ResolveTxStatusResponse{Status: "COMMITTED", Error: "OK"}, nil

@@ -327,6 +327,8 @@ func walEntryFromOp(me int, commandIndex int, term int, oper Op) wal.Entry {
 			entry.TxWriteDeletes = append(entry.TxWriteDeletes, k.IsDelete)
 		}
 		entry.TxTimeoutMs = t.TimeoutMs
+		entry.TxCoordinatorGroup = t.CoordinatorGroupID
+		entry.TxParticipantGroups = append([]int(nil), t.ParticipantGroupIDs...)
 	case *CommitTxArgs, CommitTxArgs:
 		t := reqPtr[CommitTxArgs](oper.Req)
 		entry.OpType = "COMMIT_TX"
@@ -349,6 +351,12 @@ func walEntryFromOp(me int, commandIndex int, term int, oper Op) wal.Entry {
 		t := reqPtr[ResolveTxStatusArgs](oper.Req)
 		entry.OpType = "RESOLVE_TX_STATUS"
 		entry.Key = t.TxID
+	case *RecordTxDecisionArgs, RecordTxDecisionArgs:
+		t := reqPtr[RecordTxDecisionArgs](oper.Req)
+		entry.OpType = "RECORD_TX_DECISION"
+		entry.Key = t.TxID
+		entry.TxDecision = int(t.Decision)
+		entry.TxParticipantGroups = append([]int(nil), t.ParticipantGroupIDs...)
 	default:
 		entry.OpType = fmt.Sprintf("%T", oper.Req)
 	}
@@ -399,7 +407,7 @@ func walEntryToRequest(entry wal.Entry) (any, bool, error) {
 		for i, key := range entry.TxWriteKeys {
 			writes = append(writes, WriteKey{Key: key, Value: entry.TxWriteValues[i], Version: Tversion(entry.TxWriteVersions[i]), IsDelete: entry.TxWriteDeletes[i]})
 		}
-		return &PrepareTxArgs{TxID: entry.Key, ReadKeys: reads, WriteKeys: writes, TimeoutMs: entry.TxTimeoutMs}, true, nil
+		return &PrepareTxArgs{TxID: entry.Key, ReadKeys: reads, WriteKeys: writes, TimeoutMs: entry.TxTimeoutMs, CoordinatorGroupID: entry.TxCoordinatorGroup, ParticipantGroupIDs: append([]int(nil), entry.TxParticipantGroups...)}, true, nil
 	case "COMMIT_TX":
 		if len(entry.TxWriteKeys) != len(entry.TxWriteValues) || len(entry.TxWriteKeys) != len(entry.TxWriteVersions) || len(entry.TxWriteKeys) != len(entry.TxWriteDeletes) {
 			return nil, false, fmt.Errorf("invalid commit tx WAL entry")
@@ -411,6 +419,8 @@ func walEntryToRequest(entry wal.Entry) (any, bool, error) {
 		return &CommitTxArgs{TxID: entry.Key, WriteKeys: writes}, true, nil
 	case "ABORT_TX":
 		return &AbortTxArgs{TxID: entry.Key}, true, nil
+	case "RECORD_TX_DECISION":
+		return &RecordTxDecisionArgs{TxID: entry.Key, Decision: TxStatus(entry.TxDecision), ParticipantGroupIDs: append([]int(nil), entry.TxParticipantGroups...)}, true, nil
 	case "RESOLVE_TX_STATUS":
 		return &ResolveTxStatusArgs{TxID: entry.Key}, false, nil
 	default:

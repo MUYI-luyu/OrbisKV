@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	pb "kvraft/api/pb/kvraft/api/pb"
+	"kvraft/pkg/storage"
 )
 
 func TestShardStateSnapshotRoundTrip(t *testing.T) {
@@ -119,5 +120,29 @@ func TestSnapshotRestoreCombinedState(t *testing.T) {
 	meta, ok := restored.shardMgr.GetShardState(shard)
 	if !ok || meta.state != pb.ShardState_ABSENT || meta.targetGroup != 8 || restored.TopologyEpoch() != 12 {
 		t.Fatalf("combined metadata mismatch: %+v epoch=%d", meta, restored.TopologyEpoch())
+	}
+}
+
+func TestSnapshotRestoreDurableTransactionDecision(t *testing.T) {
+	store, err := storage.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	kv := NewKVServer(0, 1, "snapshot-decision", store)
+	if got := kv.txMgr.RecordDecision(&RecordTxDecisionArgs{TxID: "snapshot-decision", Decision: TxStatusCommitted, ParticipantGroupIDs: []int{1, 2}}); got.Err != OK {
+		t.Fatalf("record: %s", got.Err)
+	}
+	snapshot := kv.Snapshot()
+	store2, err := storage.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	defer store2.Close()
+	kv2 := NewKVServer(0, 1, "snapshot-decision-restore", store2)
+	kv2.Restore(snapshot)
+	status := kv2.txMgr.ResolveTxStatus(&ResolveTxStatusArgs{TxID: "snapshot-decision"})
+	if status.Status != TxStatusCommitted || len(status.ParticipantGroupIDs) != 2 {
+		t.Fatalf("restored=%+v", status)
 	}
 }

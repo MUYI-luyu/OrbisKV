@@ -135,3 +135,93 @@ func TestCrossShard2PCPrepareFailureAbortsOtherGroup(t *testing.T) {
 	}
 	_, _ = ck.router.AbortTxToGroup(ctx, gid1, &pb.AbortTxRequest{TxId: "blocking-tx"})
 }
+
+func TestCrossShard2PCRecoversPartialCommitFromDurableDecision(t *testing.T) {
+	ck, cleanup := startTxE2ECluster(t)
+	defer cleanup()
+	key1, key2, gid1, gid2 := keysInDifferentGroups(t, ck)
+	seedTxE2EKeys(t, ck, key1, key2)
+	coordinator := gid1
+	if gid2 < coordinator {
+		coordinator = gid2
+	}
+	txID := "partial-commit-recovery"
+	groups := []int32{int32(gid1), int32(gid2)}
+	prepares := []struct {
+		gid        int
+		key, value string
+	}{{gid1, key1, "one"}, {gid2, key2, "two"}}
+	for _, p := range prepares {
+		resp, err := ck.router.PrepareTxToGroup(context.Background(), p.gid, &pb.PrepareTxRequest{TxId: txID, WriteKeys: []*pb.WriteKey{{Key: p.key, Value: p.value, Version: 1}}, CoordinatorGroupId: int32(coordinator), ParticipantGroupIds: groups, TimeoutMs: 1})
+		if err != nil || resp.GetError() != string(OK) {
+			t.Fatalf("prepare group %d: %v/%v", p.gid, resp, err)
+		}
+	}
+	decision, err := ck.router.CommitTxToGroup(context.Background(), coordinator, &pb.CommitTxRequest{TxId: txID, DecisionOnly: true, ParticipantGroupIds: groups})
+	if err != nil || decision.GetError() != string(OK) {
+		t.Fatalf("durable decision: %v/%v", decision, err)
+	}
+	first := gid1
+	second := gid2
+	if first != coordinator {
+		first, second = second, first
+	}
+	resp, err := ck.router.CommitTxToGroup(context.Background(), first, &pb.CommitTxRequest{TxId: txID})
+	if err != nil || resp.GetError() != string(OK) {
+		t.Fatalf("first commit: %v/%v", resp, err)
+	}
+	if errCode := ck.RecoverTransaction(txID, second); errCode != OK {
+		t.Fatalf("recover: %s", errCode)
+	}
+	for key, want := range map[string]string{key1: "one", key2: "two"} {
+		value, version, _, getErr := ck.Get(key)
+		if getErr != OK || value != want || version != 2 {
+			t.Fatalf("%s=%q/%d/%s", key, value, version, getErr)
+		}
+	}
+}
+
+func TestCrossShard2PCPrepareFailureRecordsDurableAbort(t *testing.T) {
+	ck, cleanup := startTxE2ECluster(t)
+	defer cleanup()
+	key1, key2, gid1, gid2 := keysInDifferentGroups(t, ck)
+	seedTxE2EKeys(t, ck, key1, key2)
+	_, _ = ck.router.PrepareTxToGroup(context.Background(), gid1, &pb.PrepareTxRequest{TxId: "block", WriteKeys: []*pb.WriteKey{{Key: key1, Value: "x", Version: 1}}, TimeoutMs: 10000})
+	tx := ck.Begin()
+	tx.Put(key1, "one", 1)
+	tx.Put(key2, "two", 1)
+	if got := tx.Commit(); got != ErrTxConflict {
+		t.Fatalf("commit=%s", got)
+	}
+	coordinator := gid1
+	if gid2 < coordinator {
+		coordinator = gid2
+	}
+	status, err := ck.router.ResolveTxStatusToGroup(context.Background(), coordinator, &pb.ResolveTxStatusRequest{TxId: tx.txID})
+	if err != nil || status.GetStatus() != "ABORTED" {
+		t.Fatalf("durable abort=%v/%v", status, err)
+	}
+	_, _ = ck.router.AbortTxToGroup(context.Background(), gid1, &pb.AbortTxRequest{TxId: "block"})
+}
+
+func TestCrossGroupReadOnlyParticipantIsPrepared(t *testing.T) {
+	ck, cleanup := startTxE2ECluster(t)
+	defer cleanup()
+	readKey, writeKey, _, _ := keysInDifferentGroups(t, ck)
+	seedTxE2EKeys(t, ck, readKey, writeKey)
+	tx := ck.Begin()
+	if value, _, err := tx.Get(readKey); err != OK || value != "initial" {
+		t.Fatalf("read=%q/%s", value, err)
+	}
+	if err := ck.Put(readKey, "external", 1); err != OK {
+		t.Fatalf("external update: %s", err)
+	}
+	tx.Put(writeKey, "transactional", 1)
+	if got := tx.Commit(); got != ErrTxConflict {
+		t.Fatalf("commit=%s, want conflict", got)
+	}
+	value, version, _, err := ck.Get(writeKey)
+	if err != OK || value != "initial" || version != 1 {
+		t.Fatalf("write participant changed: %q/%d/%s", value, version, err)
+	}
+}

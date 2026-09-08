@@ -1292,3 +1292,82 @@ func TestPrepareWithEmptyTxID(t *testing.T) {
 		t.Fatalf("空 txID Prepare 应返回 OK，实际返回: %s", reply.Err)
 	}
 }
+
+func TestDurableCoordinatorDecisionSurvivesParticipantResolution(t *testing.T) {
+	tm, kv, cleanup := setupTestTxManager(t)
+	defer cleanup()
+	seedKey(t, kv, "a", "old", 1)
+	reply := tm.Prepare(&PrepareTxArgs{TxID: "tx-durable", WriteKeys: []WriteKey{{Key: "a", Value: "new", Version: 1}}, CoordinatorGroupID: 7, ParticipantGroupIDs: []int{2, 7}})
+	if reply.Err != OK {
+		t.Fatalf("prepare: %s", reply.Err)
+	}
+	if tm.RecordDecision(&RecordTxDecisionArgs{TxID: "tx-durable", Decision: TxStatusCommitted, ParticipantGroupIDs: []int{2, 7}}).Err != OK {
+		t.Fatal("record decision")
+	}
+	status := tm.ResolveTxStatus(&ResolveTxStatusArgs{TxID: "tx-durable"})
+	if status.Status != TxStatusCommitted {
+		t.Fatalf("status=%v", status.Status)
+	}
+	if status.CoordinatorGroupID != 0 {
+		t.Fatalf("coordinator metadata on decision-only response=%d", status.CoordinatorGroupID)
+	}
+	if tm.Commit(&CommitTxArgs{TxID: "tx-durable", WriteKeys: []WriteKey{{Key: "a", Value: "tampered", Version: 999}}}).Err != OK {
+		t.Fatal("commit should use prepared write set")
+	}
+	value, version, _, exists, err := kv.store.Get("a")
+	if err != nil || !exists || value != "new" || version != 2 {
+		t.Fatalf("restored write=%q/%d exists=%v err=%v", value, version, exists, err)
+	}
+}
+
+func TestPreparedWithoutDecisionRemainsPrepared(t *testing.T) {
+	tm, kv, cleanup := setupTestTxManager(t)
+	defer cleanup()
+	seedKey(t, kv, "a", "old", 1)
+	if tm.Prepare(&PrepareTxArgs{TxID: "tx-blocked", WriteKeys: []WriteKey{{Key: "a", Value: "new", Version: 1}}, CoordinatorGroupID: 0, ParticipantGroupIDs: []int{0}}).Err != OK {
+		t.Fatal("prepare")
+	}
+	status := tm.ResolveTxStatus(&ResolveTxStatusArgs{TxID: "tx-blocked"})
+	if status.Status != TxStatusPrepared {
+		t.Fatalf("status=%v", status.Status)
+	}
+	if tm.Commit(&CommitTxArgs{TxID: "tx-blocked", WriteKeys: nil}).Err != ErrTxConflict && tm.Commit(&CommitTxArgs{TxID: "tx-blocked"}).Err != ErrTxConflict {
+		t.Fatal("expected CAS failure while undecided")
+	}
+}
+
+func TestTransactionDecisionWALRoundTrip(t *testing.T) {
+	entry := walEntryFromOp(1, 9, 3, Op{Req: &RecordTxDecisionArgs{TxID: "wal-decision", Decision: TxStatusCommitted, ParticipantGroupIDs: []int{1, 4}}})
+	req, mutating, err := walEntryToRequest(entry)
+	if err != nil || !mutating {
+		t.Fatalf("round trip: mutating=%v err=%v", mutating, err)
+	}
+	decision, ok := req.(*RecordTxDecisionArgs)
+	if !ok || decision.TxID != "wal-decision" || decision.Decision != TxStatusCommitted || len(decision.ParticipantGroupIDs) != 2 {
+		t.Fatalf("decision=%#v", req)
+	}
+}
+
+func TestParticipantRestartRestoresCoordinatorMetadataAndPreparedWrite(t *testing.T) {
+	tm, kv, cleanup := setupTestTxManager(t)
+	defer cleanup()
+	seedKey(t, kv, "restart-key", "old", 1)
+	if got := tm.Prepare(&PrepareTxArgs{TxID: "participant-restart", WriteKeys: []WriteKey{{Key: "restart-key", Value: "new", Version: 1}}, CoordinatorGroupID: 7, ParticipantGroupIDs: []int{2, 7}}); got.Err != OK {
+		t.Fatalf("prepare: %s", got.Err)
+	}
+	restarted := NewTxManager(kv)
+	if err := restarted.RebuildLockTable(); err != nil {
+		t.Fatal(err)
+	}
+	status := restarted.ResolveTxStatus(&ResolveTxStatusArgs{TxID: "participant-restart"})
+	if status.Status != TxStatusPrepared || status.CoordinatorGroupID != 7 || len(status.ParticipantGroupIDs) != 2 {
+		t.Fatalf("restored status=%+v", status)
+	}
+	if got := restarted.Commit(&CommitTxArgs{TxID: "participant-restart", WriteKeys: []WriteKey{{Key: "restart-key", Value: "tampered", Version: 99}}}); got.Err != OK {
+		t.Fatalf("commit: %s", got.Err)
+	}
+	value, version, _, exists, err := kv.store.Get("restart-key")
+	if err != nil || !exists || value != "new" || version != 2 {
+		t.Fatalf("value=%q/%d exists=%v err=%v", value, version, exists, err)
+	}
+}
