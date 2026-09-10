@@ -1,4 +1,4 @@
-# SwiftKV
+# OrbisKV
 
 > 基于自研 Raft 协议实现的分布式强一致性 KV 存储系统，支持水平分片、在线迁移与跨分片事务。
 
@@ -13,8 +13,8 @@
 
 - **自研 Raft 共识** — 选举、日志复制、快照压缩及崩溃恢复。增量持久化与异步流水线解耦磁盘 I/O 与共识路径，**租约读**绕过共识降低读延迟。
 - **跨分片 2PC 事务** — 零外部依赖（无 TSO/MVCC），事务决策经 Raft 共识持久化。乐观读校验 + 悲观写锁。CAS 批量写与事务标记在单个 BadgerDB 事务中原子落盘，Raft 日志重放安全。
-- **哈希槽分片路由** — 固定 1024 个哈希槽（类 Redis Cluster），xxhash 取模实现 O(1) Key→Group 路由，支持水平扩展与负载均衡。
-- **在线安全迁移** — 6 阶段 Shard 状态机（OWNED → MIGRATING → IMPORTING → ABSENT），迁移期间以双写保证 CP 语义，业务写入零中断。
+- **哈希槽分片路由** — 固定 1024 个哈希槽（类 Redis Cluster），key 经两级映射（key→shard→group）定位到 group，数组索引 O(1) 路由，支持水平扩展与负载均衡。
+- **在线安全迁移** — 6 阶段 Shard 状态机（OWNED → MIGRATING → IMPORTING → ABSENT），迁移期间以双写保证源和目标一致性（CP 语义），业务写入零中断。
 - **CAS 版本控制** — 乐观锁并发模型，Put 操作校验版本号，规避分布式环境下的丢失更新。
 - **Watch 事件订阅** — 基于 gRPC 双向流实现 Key/Prefix 级变更推送，Leader 感知自动重连。
 - **TTL 过期治理** — 被动失效检测 + 最小堆主动扫描，精准清理过期键。
@@ -32,8 +32,8 @@
 ### 构建
 
 ```bash
-git clone git@github.com:jianger-yu/KVraft.git
-cd KVraft
+git clone https://github.com/MUYI-luyu/OrbisKV.git
+cd OrbisKV
 go build ./...
 ```
 
@@ -64,7 +64,7 @@ docker compose -f deployments/docker-compose.yml down
 
 | 服务 | 端口 | 说明 |
 |------|------|------|
-| KVraft 节点 (×3) | 6000-6002 (gRPC) / 8001-8003 (REST) | Raft 集群 |
+| OrbisKV 节点 (×3) | 6000-6002 (gRPC) / 8001-8003 (REST) | Raft 集群 |
 | Prometheus | 9090 | 指标采集 |
 | Grafana | 3000 (admin/admin) | 可视化面板 |
 
@@ -196,16 +196,20 @@ ShardRouter ──► hash(key) % 1024 ──► Group ID ──► gRPC ──�
 
 ### 性能基准
 
-> 3 节点 Docker 集群，10 客户端 × 10,000 请求
+> 9 节点集群（3 Group × 3 Replica），1000 客户端 × 10 请求，70% 写 / 30% 读
 
-| 负载 | 吞吐 | 延迟 (avg/P99) |
-|------|------|----------------|
-| 纯读 | **52,179 ops/s** | 0.19ms / 0.50ms |
-| 纯写 | 1,948 ops/s | 5.13ms / 12.42ms |
-| 混合读/写 (50/50) | 3,905 ops/s | 2.53ms / 6.09ms |
+| 指标 | 数值 |
+|------|------|
+| 总吞吐 | **16,976 ops/s** |
+| 写入吞吐 | 11,044 ops/s |
+| 平均延迟 | 50.15 ms |
+| P99 延迟 | 144.68 ms |
+| 写入冲突率 | 7.64% |
 
-- **读比写快 27 倍** — 租约读跳过 Raft 往返，直达 BadgerDB，纯读延迟仅 0.19ms；瓶颈在 gRPC 序列化（BadgerDB 查询仅占 ~5µs），而非存储引擎
-- **写上限 ~2k ops/s** — 三副本日志同步是分布式一致性的代价，并非 Go 或 BadgerDB 限制
+**说明**：
+- 三副本 Raft 日志同步是分布式一致性的代价，写入受限于网络往返与 fsync
+- 租约读优化可降低读延迟（绕过 Raft 往返直达 BadgerDB）
+- 实际吞吐受客户端并发数、网络环境、硬件配置影响
 
 ---
 
@@ -213,11 +217,11 @@ ShardRouter ──► hash(key) % 1024 ──► Group ID ──► gRPC ──�
 
 ```
 Phase 1: Target ← IMPORTING       目标准备接收
-Phase 2: Source ← MIGRATING       双写开始（本地 + 转发 target）
-Phase 3: bulkCopy                 批量同步存量数据
+Phase 2: Source ← MIGRATING       双写开始（本地写 + 转发到 target）
+Phase 3: bulkCopyShard            批量拷贝存量数据（全量扫描 + Put）
 Phase 4: Target ← OWNED          目标成为正式 owner，双写结束
 Phase 5: Source ← ABSENT         源停止服务该 shard
-Phase 6: Clean                    清理源上过期数据
+Phase 6: cleanShardData           清理源端过期数据
 ```
 
 ---
