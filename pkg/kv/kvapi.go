@@ -34,10 +34,13 @@ type GetArgs struct {
 
 // GetReply 是 Get 操作的结果。
 type GetReply struct {
-	Value   string
-	Version Tversion
-	Expires int64
-	Err     Err
+	Value        string
+	Version      Tversion
+	Expires      int64
+	Err          Err
+	HintGroupID  int
+	HintReplicas []string
+	HintEpoch    int64
 }
 
 // PutArgs 是 Put 操作的参数。
@@ -50,8 +53,11 @@ type PutArgs struct {
 
 // PutReply 是 Put 操作的结果。
 type PutReply struct {
-	Err      Err
-	OldValue string // 修改前的值（用于Watch事件）
+	Err          Err
+	OldValue     string // 修改前的值（用于Watch事件）
+	HintGroupID  int
+	HintReplicas []string
+	HintEpoch    int64
 }
 
 // DeleteArgs 是 Delete 操作的参数。
@@ -61,8 +67,11 @@ type DeleteArgs struct {
 
 // DeleteReply 是 Delete 操作的结果。
 type DeleteReply struct {
-	Err      Err
-	OldValue string
+	Err          Err
+	OldValue     string
+	HintGroupID  int
+	HintReplicas []string
+	HintEpoch    int64
 }
 
 type CleanupShardKey struct {

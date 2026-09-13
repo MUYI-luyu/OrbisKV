@@ -110,12 +110,7 @@ func (s *grpcKVService) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRes
 		}
 	}
 
-	return &pb.GetResponse{
-		Value:   reply.Value,
-		Version: int64(reply.Version),
-		Error:   errReply(reply.Err),
-		Expires: reply.Expires,
-	}, nil
+	return &pb.GetResponse{Value: reply.Value, Version: int64(reply.Version), Error: errReply(reply.Err), Expires: reply.Expires, HintGroupId: int32(reply.HintGroupID), HintReplicas: reply.HintReplicas, HintEpoch: reply.HintEpoch}, nil
 }
 
 func (s *grpcKVService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
@@ -134,7 +129,7 @@ func (s *grpcKVService) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRes
 		return &pb.PutResponse{Error: "ErrInternal"}, nil
 	}
 
-	return &pb.PutResponse{Error: errReply(reply.Err)}, nil
+	return &pb.PutResponse{Error: errReply(reply.Err), HintGroupId: int32(reply.HintGroupID), HintReplicas: reply.HintReplicas, HintEpoch: reply.HintEpoch}, nil
 }
 
 func (s *grpcKVService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
@@ -152,7 +147,7 @@ func (s *grpcKVService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.
 		return &pb.DeleteResponse{Error: "ErrInternal"}, nil
 	}
 
-	return &pb.DeleteResponse{Error: errReply(reply.Err)}, nil
+	return &pb.DeleteResponse{Error: errReply(reply.Err), HintGroupId: int32(reply.HintGroupID), HintReplicas: reply.HintReplicas, HintEpoch: reply.HintEpoch}, nil
 }
 
 func (s *grpcKVService) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {

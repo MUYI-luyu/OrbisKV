@@ -675,7 +675,11 @@ func (r *ShardRouter) GetRoute(ctx context.Context, key string) (*pb.GetResponse
 	if err != nil {
 		return nil, err
 	}
-	return r.GetFromGroup(ctx, gid, key)
+	resp, err := r.GetFromGroup(ctx, gid, key)
+	if err == nil {
+		r.learnHint(key, resp.GetHintGroupId(), resp.GetHintReplicas(), resp.GetHintEpoch())
+	}
+	return resp, err
 }
 
 // PutRoute 路由 Put 请求（不带 TTL）。
@@ -689,7 +693,11 @@ func (r *ShardRouter) PutRouteWithTTL(ctx context.Context, key string, value str
 	if err != nil {
 		return nil, err
 	}
-	return r.PutToGroupWithTTL(ctx, gid, key, value, version, ttlSeconds)
+	resp, err := r.PutToGroupWithTTL(ctx, gid, key, value, version, ttlSeconds)
+	if err == nil {
+		r.learnHint(key, resp.GetHintGroupId(), resp.GetHintReplicas(), resp.GetHintEpoch())
+	}
+	return resp, err
 }
 
 // DeleteRoute 路由 Delete 请求。
@@ -698,7 +706,58 @@ func (r *ShardRouter) DeleteRoute(ctx context.Context, key string) (*pb.DeleteRe
 	if err != nil {
 		return nil, err
 	}
-	return r.DeleteFromGroup(ctx, gid, key)
+	resp, err := r.DeleteFromGroup(ctx, gid, key)
+	if err == nil {
+		r.learnHint(key, resp.GetHintGroupId(), resp.GetHintReplicas(), resp.GetHintEpoch())
+	}
+	return resp, err
+}
+
+func (r *ShardRouter) learnHint(key string, gid int32, replicas []string, epoch int64) {
+	if gid <= 0 || len(replicas) == 0 || r.topology == nil {
+		return
+	}
+	shard := r.topology.ShardForKey(key)
+	if epoch < r.topology.GetEpoch() {
+		return
+	}
+	groupID := int(gid)
+	r.mu.Lock()
+	if _, ok := r.groupsByID[groupID]; !ok {
+		r.groupsByID[groupID] = RaftGroupConfig{GroupID: groupID, Replicas: append([]string(nil), replicas...)}
+		r.groupConns[groupID] = make(map[string]*grpc.ClientConn)
+		r.groupClients[groupID] = make(map[string]pb.KVServiceClient)
+		r.topology.RegisterGroup(groupID, replicas)
+	}
+	if epoch >= r.topology.GetEpoch() {
+		if owner, ok := r.topology.GroupForShard(shard); !ok || owner != groupID {
+			r.topology.MoveShard(shard, groupID)
+		}
+	}
+	r.mu.Unlock()
+
+	for _, addr := range replicas {
+		r.mu.RLock()
+		_, exists := r.groupClients[groupID][addr]
+		r.mu.RUnlock()
+		if exists {
+			continue
+		}
+		dialCtx, cancel := context.WithTimeout(context.Background(), r.config.ConnectTimeout)
+		conn, err := grpc.DialContext(dialCtx, addr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+		cancel()
+		if err != nil {
+			continue
+		}
+		r.mu.Lock()
+		if _, exists := r.groupClients[groupID][addr]; exists {
+			_ = conn.Close()
+		} else {
+			r.groupConns[groupID][addr] = conn
+			r.groupClients[groupID][addr] = pb.NewKVServiceClient(conn)
+		}
+		r.mu.Unlock()
+	}
 }
 
 // ScanRoute 跨分片执行 Scan 并合并结果（按 key 排序）。

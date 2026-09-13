@@ -42,6 +42,9 @@ message GetResponse {
   int64 version = 2;
   string error = 3;
   int64 expires = 4;
+  int32 hint_group_id = 10;
+  repeated string hint_replicas = 11;
+  int64 hint_epoch = 12;
 }
 
 message PutRequest {
@@ -53,6 +56,9 @@ message PutRequest {
 
 message PutResponse {
   string error = 1;
+  int32 hint_group_id = 10;
+  repeated string hint_replicas = 11;
+  int64 hint_epoch = 12;
 }
 
 message DeleteRequest {
@@ -61,6 +67,9 @@ message DeleteRequest {
 
 message DeleteResponse {
   string error = 1;
+  int32 hint_group_id = 10;
+  repeated string hint_replicas = 11;
+  int64 hint_epoch = 12;
 }
 
 // ============ 范围查询 ============

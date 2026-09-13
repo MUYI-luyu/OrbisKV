@@ -199,6 +199,18 @@ func (kv *KVServer) doCleanupShard(args *CleanupShardArgs) CleanupShardReply {
 	return CleanupShardReply{Deleted: len(ops), Err: OK}
 }
 
+func (kv *KVServer) wrongGroupGetReply(meta shardMeta) GetReply {
+	return GetReply{Err: ErrWrongGroup, HintGroupID: meta.targetGroup, HintReplicas: append([]string(nil), meta.targetReplicas...), HintEpoch: kv.shardMgr.GetEpoch()}
+}
+
+func (kv *KVServer) wrongGroupPutReply(meta shardMeta) PutReply {
+	return PutReply{Err: ErrWrongGroup, HintGroupID: meta.targetGroup, HintReplicas: append([]string(nil), meta.targetReplicas...), HintEpoch: kv.shardMgr.GetEpoch()}
+}
+
+func (kv *KVServer) wrongGroupDeleteReply(meta shardMeta) DeleteReply {
+	return DeleteReply{Err: ErrWrongGroup, HintGroupID: meta.targetGroup, HintReplicas: append([]string(nil), meta.targetReplicas...), HintEpoch: kv.shardMgr.GetEpoch()}
+}
+
 func (kv *KVServer) doGet(args *GetArgs) GetReply {
 	if kv.killed() {
 		return GetReply{Err: ErrWrongLeader}
@@ -208,7 +220,7 @@ func (kv *KVServer) doGet(args *GetArgs) GetReply {
 	shardID := kv.shardForKey(args.Key)
 	if meta, ok := kv.shardMgr.GetShardState(shardID); ok {
 		if meta.state == pb.ShardState_ABSENT {
-			return GetReply{Err: ErrWrongGroup}
+			return kv.wrongGroupGetReply(meta)
 		}
 	}
 
@@ -245,7 +257,7 @@ func (kv *KVServer) doPut(args *PutArgs) PutReply {
 	if meta, ok := kv.shardMgr.GetShardState(shardID); ok {
 		switch meta.state {
 		case pb.ShardState_ABSENT:
-			return PutReply{Err: ErrWrongGroup}
+			return kv.wrongGroupPutReply(meta)
 		case pb.ShardState_MIGRATING:
 			// 双写阶段：先写本地，再转发到目标 group
 			return kv.doPutWithForward(args, meta)
@@ -353,7 +365,7 @@ func (kv *KVServer) doDeleteWithForward(args *DeleteArgs, meta shardMeta) Delete
 			return DeleteReply{Err: ErrMaybe}
 		}
 		log.Printf("[KVServer-%d] forward delete to group %d failed; source restored: %v", kv.me, meta.targetGroup, fwdErr)
-		return DeleteReply{Err: ErrWrongGroup}
+		return kv.wrongGroupDeleteReply(meta)
 	}
 	return DeleteReply{Err: OK, OldValue: oldValue}
 }
@@ -368,7 +380,7 @@ func (kv *KVServer) doDelete(args *DeleteArgs) DeleteReply {
 	if meta, ok := kv.shardMgr.GetShardState(shardID); ok {
 		switch meta.state {
 		case pb.ShardState_ABSENT:
-			return DeleteReply{Err: ErrWrongGroup}
+			return kv.wrongGroupDeleteReply(meta)
 		case pb.ShardState_MIGRATING:
 			// 双写：本地删除 + 转发到目标 group
 			return kv.doDeleteWithForward(args, meta)
