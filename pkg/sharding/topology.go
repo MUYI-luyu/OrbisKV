@@ -188,6 +188,20 @@ func (st *ShardTopology) GroupIDs() []int {
 	return ids
 }
 
+// RegisterGroup adds a group without changing shard ownership.
+func (st *ShardTopology) RegisterGroup(gid int, replicas []string) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if gid <= 0 || len(replicas) == 0 {
+		return false
+	}
+	if _, ok := st.groups[gid]; ok {
+		return true
+	}
+	st.groups[gid] = append([]string(nil), replicas...)
+	return true
+}
+
 // MoveShard 将 shard 所有权转移到目标 group（迁移用）。
 // 调用方负责保证迁移期间的数据一致性（双写/锁）。
 func (st *ShardTopology) MoveShard(shard int, toGroup int) bool {

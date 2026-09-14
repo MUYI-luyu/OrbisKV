@@ -461,7 +461,7 @@ func (m *Migrator) MigrateShardOnline(ctx context.Context, shardID int, sourceGI
 	// Phase 5: Source ← ABSENT（停止服务该 shard）
 	log.Printf("[migrate] Phase 5: shard=%d source=%d ← ABSENT", shardID, sourceGID)
 	if err := setRemoteShardState(ctx, src, &pb.SetShardStateRequest{
-		ShardId: int32(shardID), State: pb.ShardState_ABSENT, TopologyEpoch: nextEpoch,
+		ShardId: int32(shardID), State: pb.ShardState_ABSENT, TargetGroup: int32(targetGID), TargetReplicas: targetReplicas, TopologyEpoch: nextEpoch,
 	}); err != nil {
 		rollbackErr := m.rollbackOnlineMigration(src, tgt, shardID, sourceOriginal, targetOriginal, phase1Done, phase2Done, copied)
 		return combineMigrationErrors(fmt.Errorf("phase 5 source.ABSENT failed: %w", err), rollbackErr)
