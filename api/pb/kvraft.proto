@@ -30,6 +30,7 @@ service KVService {
   rpc CommitTx(CommitTxRequest) returns (CommitTxResponse);
   rpc AbortTx(AbortTxRequest) returns (AbortTxResponse);
   rpc ResolveTxStatus(ResolveTxStatusRequest) returns (ResolveTxStatusResponse);
+  rpc QueryTxDecision(QueryTxDecisionRequest) returns (QueryTxDecisionResponse);
 }
 
 // ============ 基础操作 ============
@@ -243,4 +244,13 @@ message ResolveTxStatusResponse {
   string error = 4;
   int32 coordinator_group_id = 5;
   repeated int32 participant_group_ids = 6;
+}
+
+message QueryTxDecisionRequest {
+  string tx_id = 1;
+}
+
+message QueryTxDecisionResponse {
+  string decision = 1;  // "COMMITTED" / "ABORTED" / "UNKNOWN"
+  string error = 2;
 }

@@ -1,12 +1,16 @@
 package kv
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
+	pb "kvraft/api/pb/kvraft/api/pb"
+	"kvraft/pkg/sharding"
 	"kvraft/pkg/storage"
 )
 
@@ -36,14 +40,16 @@ type TxManager struct {
 	lockTable   map[string]string            // key → txID
 	preparedTxs map[string]*preparedTxRecord // txID → 记录（内存缓存）
 	kv          *KVServer
+	router      *sharding.ShardRouter // 用于查询远程 Coordinator 决策
 }
 
 // NewTxManager 创建一个新的事务管理器。
-func NewTxManager(kv *KVServer) *TxManager {
+func NewTxManager(kv *KVServer, router *sharding.ShardRouter) *TxManager {
 	return &TxManager{
 		lockTable:   make(map[string]string),
 		preparedTxs: make(map[string]*preparedTxRecord),
 		kv:          kv,
+		router:      router,
 	}
 }
 
@@ -80,10 +86,30 @@ func (tm *TxManager) RebuildLockTable() error {
 			continue
 		}
 
-		if len(rec.ParticipantGroupIDs) == 0 && rec.TimeoutMs > 0 && time.Now().UnixNano() > rec.PreparedAt+rec.TimeoutMs*int64(time.Millisecond) {
-			_ = tm.kv.store.PutTxRecord(txAbortPrefix+rec.TxID, []byte("1"))
-			_ = tm.kv.store.DeleteTxRecord(txPreparePrefix + rec.TxID)
+		// 查询 Coordinator 决策
+		decision := tm.queryCoordinatorDecision(&rec)
+
+		switch decision {
+		case TxStatusCommitted:
+			// Coordinator 已 COMMIT → 执行 Commit
+			log.Printf("[TxManager] RebuildLockTable: 恢复事务 %s 为 COMMIT", rec.TxID)
+			tm.mu.Unlock()
+			tm.executeCommit(&rec)
+			tm.mu.Lock()
 			continue
+
+		case TxStatusAborted:
+			// Coordinator 已 ABORT → 执行 Abort
+			log.Printf("[TxManager] RebuildLockTable: 恢复事务 %s 为 ABORT", rec.TxID)
+			tm.mu.Unlock()
+			tm.executeAbort(&rec)
+			tm.mu.Lock()
+			continue
+
+		case TxStatusUnknown:
+			// Coordinator 无决策或通信失败 → 保持 in-doubt
+			log.Printf("[TxManager] RebuildLockTable: 事务 %s 处于 in-doubt 状态", rec.TxID)
+			// 继续保持 PREPARED 状态
 		}
 
 		// 有效的 prepare 事务 — 重建锁
@@ -95,6 +121,177 @@ func (tm *TxManager) RebuildLockTable() error {
 
 	log.Printf("[TxManager] RebuildLockTable: %d 个已 prepare 事务, %d 个已锁定 key", len(tm.preparedTxs), len(tm.lockTable))
 	return nil
+}
+
+// queryCoordinatorDecision 查询 Coordinator 的事务决策
+func (tm *TxManager) queryCoordinatorDecision(rec *preparedTxRecord) TxStatus {
+	// 情况 1：本地就是 Coordinator
+	if rec.CoordinatorGroupID == tm.kv.groupID {
+		decision, found, _ := tm.kv.store.GetTxRecord(txDecisionPrefix + rec.TxID)
+		if found {
+			var decisionRec txDecisionRecord
+			if err := json.Unmarshal(decision, &decisionRec); err == nil {
+				return decisionRec.Decision
+			}
+		}
+		return TxStatusUnknown
+	}
+
+	// 情况 2：远程 Coordinator
+	if tm.router == nil {
+		// router 未初始化（测试环境或单机模式）
+		return TxStatusUnknown
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resp, err := tm.router.QueryTxDecisionToGroup(
+		ctx,
+		rec.CoordinatorGroupID,
+		&pb.QueryTxDecisionRequest{TxId: rec.TxID},
+	)
+
+	if err != nil || resp == nil {
+		return TxStatusUnknown
+	}
+
+	switch resp.Decision {
+	case "COMMITTED":
+		return TxStatusCommitted
+	case "ABORTED":
+		return TxStatusAborted
+	default:
+		return TxStatusUnknown
+	}
+}
+
+// executeCommit 执行事务提交（不走 Raft，直接本地执行）
+func (tm *TxManager) executeCommit(rec *preparedTxRecord) {
+	// 构建写操作
+	ops := make([]storage.WriteBatchOp, 0, len(rec.WriteKeys))
+	for _, wk := range rec.WriteKeys {
+		ops = append(ops, storage.WriteBatchOp{
+			Key:             wk.Key,
+			Value:           wk.Value,
+			ExpectedVersion: uint64(wk.Version),
+			IsDelete:        wk.IsDelete,
+		})
+	}
+
+	// 原子写入用户数据 + commit 标记
+	commitData := []byte("1")
+	if err := tm.kv.store.WriteBatchWithCASAndRecord(ops, txCommitPrefix+rec.TxID, commitData); err != nil {
+		log.Printf("[TxManager] executeCommit %s 失败: %v", rec.TxID, err)
+		return
+	}
+
+	// 释放锁并清理
+	tm.mu.Lock()
+	for _, wk := range rec.WriteKeys {
+		delete(tm.lockTable, wk.Key)
+	}
+	delete(tm.preparedTxs, rec.TxID)
+	_ = tm.kv.store.DeleteTxRecord(txPreparePrefix + rec.TxID)
+	tm.mu.Unlock()
+
+	log.Printf("[TxManager] executeCommit %s 成功", rec.TxID)
+}
+
+// executeAbort 执行事务回滚（不走 Raft，直接本地执行）
+func (tm *TxManager) executeAbort(rec *preparedTxRecord) {
+	// 写入 abort 标记
+	if err := tm.kv.store.PutTxRecord(txAbortPrefix+rec.TxID, []byte("1")); err != nil {
+		log.Printf("[TxManager] executeAbort %s 写标记失败: %v", rec.TxID, err)
+		return
+	}
+
+	// 释放锁并清理
+	tm.mu.Lock()
+	for _, wk := range rec.WriteKeys {
+		delete(tm.lockTable, wk.Key)
+	}
+	delete(tm.preparedTxs, rec.TxID)
+	_ = tm.kv.store.DeleteTxRecord(txPreparePrefix + rec.TxID)
+	tm.mu.Unlock()
+
+	log.Printf("[TxManager] executeAbort %s 成功", rec.TxID)
+}
+
+// RecoverCoordinatorTransactions 在 Coordinator 重启时恢复未完成的 COMMITTED 事务
+// 应该在 bootstrap 时调用，传入 TxCoordinator 实例
+func (tm *TxManager) RecoverCoordinatorTransactions(coordinator *TxCoordinator) {
+	if coordinator == nil {
+		return
+	}
+
+	// 扫描本地 _tx:decision: 记录
+	decisions, err := tm.kv.store.ScanTxRecordsByPrefix(txDecisionPrefix)
+	if err != nil {
+		log.Printf("[TxManager] RecoverCoordinatorTransactions: scan error: %v", err)
+		return
+	}
+
+	for key, raw := range decisions {
+		txID := strings.TrimPrefix(key, txDecisionPrefix)
+
+		var rec txDecisionRecord
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			log.Printf("[TxManager] RecoverCoordinatorTransactions: 跳过损坏记录 %s: %v", key, err)
+			continue
+		}
+
+		// 只恢复 COMMITTED 事务
+		if rec.Decision != TxStatusCommitted {
+			continue
+		}
+
+		// 检查各 Participant 是否都已完成
+		allCompleted := true
+		for _, gid := range rec.ParticipantGroupIDs {
+			// 查询 Participant 的 commit 记录
+			if gid == tm.kv.groupID {
+				// 本地 Participant
+				if _, found, _ := tm.kv.store.GetTxRecord(txCommitPrefix + txID); !found {
+					allCompleted = false
+					break
+				}
+			} else {
+				// 远程 Participant - 暂时认为未完成（后续由后台重试处理）
+				allCompleted = false
+				break
+			}
+		}
+
+		if !allCompleted {
+			// 从 prepare 记录重建 writeKeys
+			prepareRaw, found, _ := tm.kv.store.GetTxRecord(txPreparePrefix + txID)
+			if !found {
+				log.Printf("[TxManager] RecoverCoordinatorTransactions: 未找到 prepare 记录 %s", txID)
+				continue
+			}
+
+			var prepareRec preparedTxRecord
+			if err := json.Unmarshal(prepareRaw, &prepareRec); err != nil {
+				log.Printf("[TxManager] RecoverCoordinatorTransactions: prepare 记录损坏 %s: %v", txID, err)
+				continue
+			}
+
+			// 按 Group 分组 writeKeys
+			writeKeysByGroup := make(map[int][]WriteKey)
+			for _, wk := range prepareRec.WriteKeys {
+				// 需要通过 router 确定 key 所属的 group
+				// 这里简化处理，从 ParticipantGroupIDs 推断
+				for _, gid := range rec.ParticipantGroupIDs {
+					writeKeysByGroup[gid] = append(writeKeysByGroup[gid], wk)
+				}
+			}
+
+			// 重启后台重试
+			log.Printf("[TxManager] RecoverCoordinatorTransactions: 恢复事务 %s Phase 2", txID)
+			go coordinator.retryCommitForRecoveredTx(txID, rec.ParticipantGroupIDs, writeKeysByGroup)
+		}
+	}
 }
 
 // Prepare 执行 2PC 的 Phase 1：
@@ -433,12 +630,32 @@ func (tm *TxManager) resolveLockLocked(txID string) bool {
 		}
 	}
 
-	if len(rec.ParticipantGroupIDs) == 0 && rec.TimeoutMs > 0 && time.Now().UnixNano() > rec.PreparedAt+rec.TimeoutMs*int64(time.Millisecond) {
-		tm.releaseLocksForTxLocked(txID)
-		delete(tm.preparedTxs, txID)
-		_ = tm.kv.store.PutTxRecord(txAbortPrefix+txID, []byte("1"))
-		_ = tm.kv.store.DeleteTxRecord(txPreparePrefix + txID)
+	// 查询 Coordinator 决策
+	tm.mu.Unlock()
+	decision := tm.queryCoordinatorDecision(rec)
+	tm.mu.Lock()
+
+	switch decision {
+	case TxStatusCommitted:
+		// Coordinator 已 COMMIT → 执行并释放锁
+		log.Printf("[TxManager] resolveLock: 事务 %s 决策为 COMMIT", txID)
+		tm.mu.Unlock()
+		tm.executeCommit(rec)
+		tm.mu.Lock()
 		return true
+
+	case TxStatusAborted:
+		// Coordinator 已 ABORT → 回滚并释放锁
+		log.Printf("[TxManager] resolveLock: 事务 %s 决策为 ABORT", txID)
+		tm.mu.Unlock()
+		tm.executeAbort(rec)
+		tm.mu.Lock()
+		return true
+
+	case TxStatusUnknown:
+		// Coordinator 无决策或通信失败 → 保持锁定
+		log.Printf("[TxManager] resolveLock: 事务 %s 状态未知，保持锁定", txID)
+		return false
 	}
 
 	// 仍然是有效的 prepare 事务 — 锁未被释放

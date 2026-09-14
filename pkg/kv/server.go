@@ -93,7 +93,7 @@ func NewKVServer(me int, groupID int, address string, store *storage.Store) *KVS
 		ttlBatch:         128,
 		shardMgr:         newShardStateManager(groupID, 1024),
 	}
-	kv.txMgr = NewTxManager(kv)
+	kv.txMgr = NewTxManager(kv, nil) // router 在 bootstrap 时设置
 	return kv
 }
 

@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -414,6 +415,57 @@ func (s *grpcKVService) ResolveTxStatus(ctx context.Context, req *pb.ResolveTxSt
 		WriteKeys: convertWriteKeysToProto(reply.WriteKeys), Error: errReply(reply.Err),
 		CoordinatorGroupId: int32(reply.CoordinatorGroupID), ParticipantGroupIds: int32Slice(reply.ParticipantGroupIDs),
 	}, nil
+}
+
+func (s *grpcKVService) QueryTxDecision(ctx context.Context, req *pb.QueryTxDecisionRequest) (*pb.QueryTxDecisionResponse, error) {
+	if s.kv.killed() {
+		return &pb.QueryTxDecisionResponse{
+			Decision: txStatusToString(TxStatusUnknown),
+			Error:    errReply(ErrWrongLeader),
+		}, nil
+	}
+
+	// 查询本地决策记录（不走 Raft，只读本地状态）
+	decision, found, err := s.kv.store.GetTxRecord(txDecisionPrefix + req.GetTxId())
+	if err != nil {
+		return &pb.QueryTxDecisionResponse{
+			Decision: txStatusToString(TxStatusUnknown),
+			Error:    errReply(ErrWrongLeader),
+		}, nil
+	}
+
+	if !found {
+		// 本地无决策记录
+		return &pb.QueryTxDecisionResponse{
+			Decision: txStatusToString(TxStatusUnknown),
+			Error:    errReply(OK),
+		}, nil
+	}
+
+	// 解析决策
+	var rec txDecisionRecord
+	if err := json.Unmarshal(decision, &rec); err != nil {
+		return &pb.QueryTxDecisionResponse{
+			Decision: txStatusToString(TxStatusUnknown),
+			Error:    errReply(ErrWrongLeader),
+		}, nil
+	}
+
+	return &pb.QueryTxDecisionResponse{
+		Decision: txStatusToString(rec.Decision),
+		Error:    errReply(OK),
+	}, nil
+}
+
+func txStatusToString(status TxStatus) string {
+	switch status {
+	case TxStatusCommitted:
+		return "COMMITTED"
+	case TxStatusAborted:
+		return "ABORTED"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 func (s *grpcKVService) GetClusterStatus(ctx context.Context, req *pb.ClusterStatusRequest) (*pb.ClusterStatusResponse, error) {

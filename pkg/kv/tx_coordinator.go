@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -211,11 +213,16 @@ func (h *TxHandle) Commit() Err {
 		return ErrTxConflict
 	}
 
+	// ===== Commit Point =====
 	if h.persistDecision(coordinatorGroup, allGroups, TxStatusCommitted) != OK {
 		return ErrTxTimeout
 	}
-	// Phase 2: the durable COMMIT decision makes retries safe.
-	return h.parallelCommit(allGroups, writeKeysByGroup)
+
+	// 事务结果确定为 COMMITTED
+	// Phase 2 不再决定返回结果，启动后台重试
+	go h.retryCommitInBackground(allGroups, writeKeysByGroup)
+
+	return OK
 }
 
 // parallelAbort 向所有给定 Group 发送 AbortTx（尽力而为）。
@@ -275,6 +282,34 @@ func (h *TxHandle) parallelCommit(groups []int, writeKeysByGroup map[int][]Write
 	return OK
 }
 
+// retryCommitInBackground 后台持续重试 Phase 2，直到所有 Participant 完成
+// 前提：Commit Point 已过，决策已持久化为 COMMITTED
+func (h *TxHandle) retryCommitInBackground(groups []int, writeKeysByGroup map[int][]WriteKey) {
+	attempt := 0
+
+	for {
+		err := h.parallelCommit(groups, writeKeysByGroup)
+
+		if err == OK {
+			log.Printf("[Coordinator] 事务 %s Phase 2 完成", h.txID)
+			return
+		}
+
+		if err == ErrTxConflict {
+			// 不应该发生（决策已是 COMMITTED）
+			// 可能是 Participant 协议错误或临时故障
+			log.Printf("[Coordinator] 事务 %s Phase 2 遇到冲突: %v，继续重试", h.txID, err)
+		}
+
+		// ErrTxTimeout: 部分 Participant 未响应，继续重试
+		backoff := backoffWithJitter(attempt, retryBackoffBase, retryBackoffMax)
+		log.Printf("[Coordinator] 事务 %s Phase 2 部分失败，%v 后重试", h.txID, backoff)
+
+		time.Sleep(backoff)
+		attempt++
+	}
+}
+
 func (h *TxHandle) persistDecision(gid int, groups []int, decision TxStatus) Err {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -301,8 +336,12 @@ func (tc *TxCoordinator) RecoverTransaction(txID string, participantGroupID int)
 	if err != nil || participant == nil {
 		return ErrTxTimeout
 	}
-	if (participant.GetStatus() == "COMMITTED" || participant.GetStatus() == "ABORTED") && len(participant.GetParticipantGroupIds()) > 0 {
-		return recoverBroadcast(tc.router, txID, intsFromInt32(participant.GetParticipantGroupIds()), participant.GetStatus() == "COMMITTED")
+	if participant.GetStatus() == "COMMITTED" || participant.GetStatus() == "ABORTED" {
+		groups := intsFromInt32(participant.GetParticipantGroupIds())
+		if len(groups) == 0 {
+			groups = []int{participantGroupID}
+		}
+		return recoverBroadcast(tc.router, txID, groups, participant.GetStatus() == "COMMITTED")
 	}
 	if participant.GetStatus() != "PREPARED" {
 		return ErrTxTimeout
@@ -329,23 +368,43 @@ func (tc *TxCoordinator) RecoverTransaction(txID string, participantGroupID int)
 
 func recoverBroadcast(router *sharding.ShardRouter, txID string, groups []int, commit bool) Err {
 	for _, gid := range groups {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		var err error
-		if commit {
-			var resp *pb.CommitTxResponse
-			resp, err = router.CommitTxToGroup(ctx, gid, &pb.CommitTxRequest{TxId: txID})
-			if err == nil && resp.GetError() != string(OK) {
-				err = fmt.Errorf("%s", resp.GetError())
+		var lastErr error
+		for attempt := 0; attempt < txCommitMaxRetries; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if commit {
+				resp, err := router.CommitTxToGroup(ctx, gid, &pb.CommitTxRequest{TxId: txID})
+				if err == nil && resp != nil && resp.GetError() == string(OK) {
+					cancel()
+					lastErr = nil
+					break
+				}
+				if err == nil && resp != nil {
+					lastErr = fmt.Errorf("%s", resp.GetError())
+				} else {
+					lastErr = err
+				}
+			} else {
+				resp, err := router.AbortTxToGroup(ctx, gid, &pb.AbortTxRequest{TxId: txID})
+				if err == nil && resp != nil && resp.GetError() == string(OK) {
+					cancel()
+					lastErr = nil
+					break
+				}
+				if err == nil && resp != nil {
+					lastErr = fmt.Errorf("%s", resp.GetError())
+				} else {
+					lastErr = err
+				}
 			}
-		} else {
-			var resp *pb.AbortTxResponse
-			resp, err = router.AbortTxToGroup(ctx, gid, &pb.AbortTxRequest{TxId: txID})
-			if err == nil && resp.GetError() != string(OK) {
-				err = fmt.Errorf("%s", resp.GetError())
+			cancel()
+			if lastErr != nil && strings.Contains(lastErr.Error(), string(ErrTxConflict)) {
+				break
+			}
+			if attempt+1 < txCommitMaxRetries {
+				time.Sleep(backoffWithJitter(attempt, retryBackoffBase, retryBackoffMax))
 			}
 		}
-		cancel()
-		if err != nil {
+		if lastErr != nil {
 			return ErrTxTimeout
 		}
 	}
@@ -457,4 +516,40 @@ func int32Slice(in []int) []int32 {
 		out[i] = int32(v)
 	}
 	return out
+}
+
+// retryCommitForRecoveredTx 为恢复的事务重试 Phase 2
+// 与 TxHandle.retryCommitInBackground 类似，但不依赖 TxHandle
+func (tc *TxCoordinator) retryCommitForRecoveredTx(
+	txID string,
+	groups []int,
+	writeKeysByGroup map[int][]WriteKey,
+) {
+	attempt := 0
+
+	for {
+		// 构造临时 TxHandle 用于调用 parallelCommit
+		h := &TxHandle{
+			txID:        txID,
+			coordinator: tc,
+		}
+
+		err := h.parallelCommit(groups, writeKeysByGroup)
+
+		if err == OK {
+			log.Printf("[Coordinator] 恢复事务 %s Phase 2 完成", txID)
+			return
+		}
+
+		if err == ErrTxConflict {
+			log.Printf("[Coordinator] 恢复事务 %s Phase 2 遇到冲突: %v，继续重试", txID, err)
+		}
+
+		// ErrTxTimeout: 部分 Participant 未响应，继续重试
+		backoff := backoffWithJitter(attempt, retryBackoffBase, retryBackoffMax)
+		log.Printf("[Coordinator] 恢复事务 %s Phase 2 部分失败，%v 后重试", txID, backoff)
+
+		time.Sleep(backoff)
+		attempt++
+	}
 }

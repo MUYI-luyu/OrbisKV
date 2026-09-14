@@ -34,7 +34,7 @@ func setupTestTxManager(t *testing.T) (*TxManager, *KVServer, func()) {
 		stats:    &ServerStats{},
 		shardMgr: newShardStateManager(0, 1024),
 	}
-	kv.txMgr = NewTxManager(kv)
+	kv.txMgr = NewTxManager(kv, nil)
 
 	cleanup := func() {
 		store.Close()
@@ -805,27 +805,27 @@ func TestResolveLockTimeoutAutoAbort(t *testing.T) {
 	tm.preparedTxs["tx-timeout"] = &rec
 	tm.mu.Unlock()
 
-	// 尝试 resolve —— 应检测到超时并自动 abort
+	// 尝试 resolve —— 超时事务应保持 in-doubt（不自动 Abort）
 	tm.mu.Lock()
 	resolved := tm.resolveLockLocked("tx-timeout")
 	tm.mu.Unlock()
 
-	if !resolved {
-		t.Fatal("超时事务的锁应被成功 resolve")
+	if resolved {
+		t.Fatal("超时事务应保持 in-doubt 状态，锁不应被释放")
 	}
 
-	// 锁应被释放
+	// 锁应仍然存在
 	tm.mu.RLock()
 	_, locked := tm.lockTable["a"]
 	tm.mu.RUnlock()
-	if locked {
-		t.Fatal("超时事务的锁应被释放")
+	if !locked {
+		t.Fatal("超时事务的锁应保持（需要查询 Coordinator 决策）")
 	}
 
-	// abort 记录应已持久化
+	// 不应自动写入 abort 记录
 	_, found, _ := kv.store.GetTxRecord("abort:tx-timeout")
-	if !found {
-		t.Fatal("超时自动 abort 应持久化 abort 记录")
+	if found {
+		t.Fatal("不应自动 Abort 超时事务")
 	}
 }
 
@@ -918,7 +918,7 @@ func TestRebuildLockTable(t *testing.T) {
 	kv.store.PutTxRecord("prepare:tx-004", raw4)
 
 	// 重建
-	tm2 := NewTxManager(kv)
+	tm2 := NewTxManager(kv, nil)
 	err := tm2.RebuildLockTable()
 	if err != nil {
 		t.Fatalf("RebuildLockTable 失败: %v", err)
@@ -962,7 +962,7 @@ func TestRebuildLockTableWithTimeout(t *testing.T) {
 
 	seedKey(t, kv, "a", "val-a", 1)
 
-	// 已超时的 prepare 记录
+	// 已超时的 prepare 记录（但 Coordinator 决策未知）
 	rec := preparedTxRecord{
 		TxID:       "tx-timeout",
 		WriteKeys:  []WriteKey{{Key: "a", Value: "new-a", Version: 1}},
@@ -972,30 +972,30 @@ func TestRebuildLockTableWithTimeout(t *testing.T) {
 	raw, _ := json.Marshal(rec)
 	kv.store.PutTxRecord("prepare:tx-timeout", raw)
 
-	tm2 := NewTxManager(kv)
+	tm2 := NewTxManager(kv, nil)
 	err := tm2.RebuildLockTable()
 	if err != nil {
 		t.Fatalf("RebuildLockTable 失败: %v", err)
 	}
 
-	// 已超时的锁不应重建
+	// 超时事务应保持 in-doubt 状态（不自动 Abort）
 	tm2.mu.RLock()
 	_, locked := tm2.lockTable["a"]
 	tm2.mu.RUnlock()
-	if locked {
-		t.Fatal("已超时事务的锁不应被重建")
+	if !locked {
+		t.Fatal("超时事务应保持 in-doubt 状态，锁应被保留")
 	}
 
-	// abort 记录应已自动写入
+	// 不应自动写入 abort 记录
 	_, found, _ := kv.store.GetTxRecord("abort:tx-timeout")
-	if !found {
-		t.Fatal("RebuildLockTable 应对超时事务自动写入 abort 记录")
+	if found {
+		t.Fatal("不应自动 Abort 超时事务（需要查询 Coordinator 决策）")
 	}
 
-	// prepare 记录应已清理
+	// prepare 记录应保留
 	_, found, _ = kv.store.GetTxRecord("prepare:tx-timeout")
-	if found {
-		t.Fatal("RebuildLockTable 应清理超时的 prepare 记录")
+	if !found {
+		t.Fatal("prepare 记录应保留（in-doubt 状态）")
 	}
 }
 
@@ -1355,7 +1355,7 @@ func TestParticipantRestartRestoresCoordinatorMetadataAndPreparedWrite(t *testin
 	if got := tm.Prepare(&PrepareTxArgs{TxID: "participant-restart", WriteKeys: []WriteKey{{Key: "restart-key", Value: "new", Version: 1}}, CoordinatorGroupID: 7, ParticipantGroupIDs: []int{2, 7}}); got.Err != OK {
 		t.Fatalf("prepare: %s", got.Err)
 	}
-	restarted := NewTxManager(kv)
+	restarted := NewTxManager(kv, nil)
 	if err := restarted.RebuildLockTable(); err != nil {
 		t.Fatal(err)
 	}

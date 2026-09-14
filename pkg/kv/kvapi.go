@@ -238,6 +238,7 @@ const (
 	TxStatusPrepared
 	TxStatusCommitted
 	TxStatusAborted
+	TxStatusUnknown  // 用于查询 Coordinator 决策时，决策未找到或通信失败
 )
 
 // ResolveTxStatusArgs 查询事务状态（用于锁恢复）。

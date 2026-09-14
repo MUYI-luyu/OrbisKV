@@ -1070,3 +1070,44 @@ func (hc *HealthChecker) checkGroupHealth() {
 		}
 	}
 }
+
+// QueryTxDecisionToGroup 查询 Coordinator 的事务决策。
+func (r *ShardRouter) QueryTxDecisionToGroup(ctx context.Context, gid int, req *pb.QueryTxDecisionRequest) (*pb.QueryTxDecisionResponse, error) {
+	var lastErr error
+	for _, replica := range r.groupReplicaCandidates(gid) {
+		r.mu.RLock()
+		client := r.groupClients[gid][replica]
+		r.mu.RUnlock()
+		if client == nil {
+			continue
+		}
+
+		reqCtx, cancel := r.withRequestTimeout(ctx)
+		resp, rpcErr := client.QueryTxDecision(reqCtx, req)
+		cancel()
+
+		if rpcErr != nil {
+			r.invalidateLeader(gid, replica)
+			lastErr = rpcErr
+			continue
+		}
+		if resp == nil {
+			r.invalidateLeader(gid, replica)
+			lastErr = fmt.Errorf("empty QueryTxDecision response from %s", replica)
+			continue
+		}
+		if r.isWrongLeader(resp.GetError()) {
+			r.invalidateLeader(gid, replica)
+			lastErr = fmt.Errorf("group %d wrong leader via %s", gid, replica)
+			continue
+		}
+
+		r.setLeader(gid, replica)
+		return resp, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no available replica for group %d", gid)
+	}
+	return nil, lastErr
+}
