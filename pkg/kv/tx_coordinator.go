@@ -203,7 +203,7 @@ func (h *TxHandle) Commit() Err {
 
 	// Any terminal action must follow a durable coordinator decision.
 	if len(prepared) < len(allGroups) {
-		if h.persistDecision(coordinatorGroup, allGroups, TxStatusAborted) != OK {
+		if h.persistDecision(coordinatorGroup, allGroups, TxStatusAborted, nil) != OK {
 			return ErrTxTimeout
 		}
 		h.parallelAbort(prepared)
@@ -214,7 +214,7 @@ func (h *TxHandle) Commit() Err {
 	}
 
 	// ===== Commit Point =====
-	if h.persistDecision(coordinatorGroup, allGroups, TxStatusCommitted) != OK {
+	if h.persistDecision(coordinatorGroup, allGroups, TxStatusCommitted, writeKeysByGroup) != OK {
 		return ErrTxTimeout
 	}
 
@@ -310,12 +310,24 @@ func (h *TxHandle) retryCommitInBackground(groups []int, writeKeysByGroup map[in
 	}
 }
 
-func (h *TxHandle) persistDecision(gid int, groups []int, decision TxStatus) Err {
+func (h *TxHandle) persistDecision(gid int, groups []int, decision TxStatus, writeKeysByGroup map[int][]WriteKey) Err {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	ids := int32Slice(groups)
+
+	// 收集所有 writeKeys
+	var allWriteKeys []WriteKey
+	for _, wks := range writeKeysByGroup {
+		allWriteKeys = append(allWriteKeys, wks...)
+	}
+
 	if decision == TxStatusCommitted {
-		resp, err := h.coordinator.router.CommitTxToGroup(ctx, gid, &pb.CommitTxRequest{TxId: h.txID, DecisionOnly: true, ParticipantGroupIds: ids})
+		resp, err := h.coordinator.router.CommitTxToGroup(ctx, gid, &pb.CommitTxRequest{
+			TxId:                h.txID,
+			DecisionOnly:        true,
+			ParticipantGroupIds: ids,
+			WriteKeys:           writeKeysToProto(allWriteKeys),
+		})
 		if err == nil && resp != nil && resp.GetError() == string(OK) {
 			return OK
 		}
@@ -434,7 +446,7 @@ func (h *TxHandle) Rollback() {
 		return
 	}
 	sort.Ints(groups)
-	if h.persistDecision(groups[0], groups, TxStatusAborted) == OK {
+	if h.persistDecision(groups[0], groups, TxStatusAborted, nil) == OK {
 		h.parallelAbort(prepared)
 	}
 }

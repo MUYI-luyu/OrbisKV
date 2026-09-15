@@ -82,7 +82,13 @@ func MakeClerk(servers []string) *Clerk {
 	if err != nil {
 		panic(fmt.Sprintf("MakeClerk: %v", err))
 	}
-	return &Clerk{router: router, coordinator: NewTxCoordinator(router)}
+
+	clerk := &Clerk{router: router, coordinator: NewTxCoordinator(router)}
+
+	// 触发所有 Group 的 Coordinator 恢复
+	triggerRecoveryOnAllGroups(router, cfg)
+
+	return clerk
 }
 
 // MakeShardedClerk 创建多 Group 分片 Clerk。
@@ -91,7 +97,30 @@ func MakeShardedClerk(cfg sharding.ShardingConfig) (*Clerk, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Clerk{router: router, coordinator: NewTxCoordinator(router)}, nil
+
+	clerk := &Clerk{router: router, coordinator: NewTxCoordinator(router)}
+
+	// 触发所有 Group 的 Coordinator 恢复
+	triggerRecoveryOnAllGroups(router, cfg)
+
+	return clerk, nil
+}
+
+// triggerRecoveryOnAllGroups 向所有 Group 触发 Coordinator 恢复。
+// 这确保了服务端重启后，客户端能够再次触发恢复流程。
+func triggerRecoveryOnAllGroups(router *sharding.ShardRouter, cfg sharding.ShardingConfig) {
+	for _, group := range cfg.Groups {
+		// 向每个 Group 发送恢复触发（异步，不阻塞客户端启动）
+		go func(gid int) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			
+			if err := router.TriggerRecoveryToGroup(ctx, gid, cfg); err != nil {
+				// 恢复失败不影响客户端使用，只是错过了一次恢复机会
+				// 下次客户端重连或心跳时会再次触发
+			}
+		}(group.GroupID)
+	}
 }
 
 // Begin 开始一个分布式事务。

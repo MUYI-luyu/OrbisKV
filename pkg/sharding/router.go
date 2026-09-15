@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -682,11 +681,6 @@ func (r *ShardRouter) GetRoute(ctx context.Context, key string) (*pb.GetResponse
 	return resp, err
 }
 
-// PutRoute 路由 Put 请求（不带 TTL）。
-func (r *ShardRouter) PutRoute(ctx context.Context, key string, value string, version int64) (*pb.PutResponse, error) {
-	return r.PutRouteWithTTL(ctx, key, value, version, 0)
-}
-
 // PutRouteWithTTL 路由 Put 请求（带 TTL，单位秒；<=0 表示不过期）。
 func (r *ShardRouter) PutRouteWithTTL(ctx context.Context, key string, value string, version int64, ttlSeconds int64) (*pb.PutResponse, error) {
 	gid, err := r.groupForKey(key)
@@ -817,6 +811,53 @@ func (r *ShardRouter) ScanRoute(ctx context.Context, prefix string, limit int32)
 	return all, nil
 }
 
+// TriggerRecoveryToGroup 向指定 Group 发送 SetRouterAndRecover RPC，
+// 触发服务端的 Coordinator 恢复流程。
+func (r *ShardRouter) TriggerRecoveryToGroup(
+	ctx context.Context,
+	gid int,
+	cfg ShardingConfig,
+) error {
+	ctx, cancel := r.withRequestTimeout(ctx)
+	defer cancel()
+
+	// 构造 protobuf 请求
+	req := &pb.SetRouterAndRecoverRequest{
+		NumShards:         int32(cfg.NumShards),
+		VirtualNodeCount:  int32(cfg.VirtualNodeCount),
+		PreferredReplicas: int32(cfg.PreferredReplicas),
+		ConnectTimeoutMs:  int32(cfg.ConnectTimeout.Milliseconds()),
+		RequestTimeoutMs:  int32(cfg.RequestTimeout.Milliseconds()),
+	}
+
+	for _, g := range cfg.Groups {
+		req.Groups = append(req.Groups, &pb.RaftGroupConfig{
+			GroupId:   int32(g.GroupID),
+			Replicas:  append([]string(nil), g.Replicas...),
+			LeaderIdx: int32(g.LeaderIdx),
+		})
+	}
+
+	// 尝试向该 Group 的副本发送
+	for _, addr := range r.groupReplicaCandidates(gid) {
+		client, ok := r.groupClients[gid][addr]
+		if !ok {
+			continue
+		}
+
+		resp, err := client.SetRouterAndRecover(ctx, req)
+		if err != nil {
+			continue
+		}
+
+		if resp.GetError() == "OK" || resp.GetError() == "" {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("failed to trigger recovery on group %d", gid)
+}
+
 func (r *ShardRouter) watchGroupsFor(key string, prefix bool) ([]int, error) {
 	if !prefix {
 		gid, err := r.groupForKey(key)
@@ -936,40 +977,6 @@ func (r *ShardRouter) WatchRoute(ctx context.Context, key string, prefix bool, h
 	return nil
 }
 
-// BatchGet 按分组并发拉取多个 key。
-func (r *ShardRouter) BatchGet(ctx context.Context, keys []string) map[string]*pb.GetResponse {
-	grouped := make(map[int][]string)
-	for _, key := range keys {
-		gid := r.Resolve(key)
-		if gid >= 0 {
-			grouped[gid] = append(grouped[gid], key)
-		}
-	}
-
-	results := make(map[string]*pb.GetResponse)
-	var resultsMu sync.Mutex
-	var wg sync.WaitGroup
-
-	for gid, groupKeys := range grouped {
-		wg.Add(1)
-		go func(groupID int, ks []string) {
-			defer wg.Done()
-
-			for _, key := range ks {
-				resp, err := r.GetRoute(ctx, key)
-				if err == nil && resp != nil {
-					resultsMu.Lock()
-					results[key] = resp
-					resultsMu.Unlock()
-				}
-			}
-		}(gid, groupKeys)
-	}
-
-	wg.Wait()
-	return results
-}
-
 // Close 释放路由器持有的连接资源。
 func (r *ShardRouter) Close() {
 	r.mu.Lock()
@@ -988,86 +995,6 @@ func (r *ShardRouter) Close() {
 		delete(r.leaderCache, gid)
 		delete(r.leaderCacheUpdatedAt, gid)
 		delete(r.groupsByID, gid)
-	}
-}
-
-// HealthChecker 定期检查各分组服务可用性。
-type HealthChecker struct {
-	router   *ShardRouter
-	interval time.Duration
-	ticker   *time.Ticker
-	done     chan struct{}
-	wg       sync.WaitGroup
-}
-
-// NewHealthChecker 创建健康检查器。
-func NewHealthChecker(router *ShardRouter, interval time.Duration) *HealthChecker {
-	return &HealthChecker{
-		router:   router,
-		interval: interval,
-		done:     make(chan struct{}),
-	}
-}
-
-// Start 启动后台健康检查协程。
-func (hc *HealthChecker) Start() {
-	hc.ticker = time.NewTicker(hc.interval)
-	hc.wg.Add(1)
-
-	go func() {
-		defer hc.wg.Done()
-		for {
-			select {
-			case <-hc.ticker.C:
-				hc.checkGroupHealth()
-			case <-hc.done:
-				return
-			}
-		}
-	}()
-}
-
-// Stop 停止后台健康检查。
-func (hc *HealthChecker) Stop() {
-	close(hc.done)
-	if hc.ticker != nil {
-		hc.ticker.Stop()
-	}
-	hc.wg.Wait()
-}
-
-func (hc *HealthChecker) checkGroupHealth() {
-	hc.router.mu.RLock()
-	groups := append([]RaftGroupConfig(nil), hc.router.config.Groups...)
-	clients := make(map[int][]pb.KVServiceClient, len(hc.router.groupClients))
-	for gid, replicas := range hc.router.groupClients {
-		arr := make([]pb.KVServiceClient, 0, len(replicas))
-		for _, c := range replicas {
-			arr = append(arr, c)
-		}
-		clients[gid] = arr
-	}
-	hc.router.mu.RUnlock()
-
-	for _, group := range groups {
-		replicaClients := clients[group.GroupID]
-		if len(replicaClients) == 0 {
-			continue
-		}
-
-		healthy := false
-		for _, client := range replicaClients {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			_, err := client.GetClusterStatus(ctx, &pb.ClusterStatusRequest{})
-			cancel()
-			if err == nil {
-				healthy = true
-				break
-			}
-		}
-		if !healthy {
-			log.Printf("[sharding] group %d health check failed: no reachable replica", group.GroupID)
-		}
 	}
 }
 

@@ -226,6 +226,7 @@ type RecordTxDecisionArgs struct {
 	TxID                string
 	Decision            TxStatus
 	ParticipantGroupIDs []int
+	WriteKeys           []WriteKey // 所有 Participants 的 writeKeys
 }
 
 type RecordTxDecisionReply struct{ Err Err }

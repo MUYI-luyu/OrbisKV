@@ -12,6 +12,7 @@ import (
 	"time"
 
 	pb "kvraft/api/pb/kvraft/api/pb"
+	"kvraft/pkg/sharding"
 	"kvraft/pkg/watch"
 
 	"google.golang.org/grpc"
@@ -326,7 +327,12 @@ func (s *grpcKVService) CommitTx(ctx context.Context, req *pb.CommitTxRequest) (
 	}
 
 	if req.GetDecisionOnly() {
-		consErr, value := s.kv.rsm.Submit(&RecordTxDecisionArgs{TxID: req.GetTxId(), Decision: TxStatusCommitted, ParticipantGroupIDs: intsFromInt32(req.GetParticipantGroupIds())})
+		consErr, value := s.kv.rsm.Submit(&RecordTxDecisionArgs{
+			TxID:                req.GetTxId(),
+			Decision:            TxStatusCommitted,
+			ParticipantGroupIDs: intsFromInt32(req.GetParticipantGroupIds()),
+			WriteKeys:           convertWriteKeysFromProto(req.GetWriteKeys()),
+		})
 		if consErr != OK {
 			return &pb.CommitTxResponse{Error: errReply(consErr)}, nil
 		}
@@ -359,7 +365,11 @@ func (s *grpcKVService) AbortTx(ctx context.Context, req *pb.AbortTxRequest) (*p
 	}
 
 	if req.GetDecisionOnly() {
-		consErr, value := s.kv.rsm.Submit(&RecordTxDecisionArgs{TxID: req.GetTxId(), Decision: TxStatusAborted, ParticipantGroupIDs: intsFromInt32(req.GetParticipantGroupIds())})
+		consErr, value := s.kv.rsm.Submit(&RecordTxDecisionArgs{
+			TxID:                req.GetTxId(),
+			Decision:            TxStatusAborted,
+			ParticipantGroupIDs: intsFromInt32(req.GetParticipantGroupIds()),
+		})
 		if consErr != OK {
 			return &pb.AbortTxResponse{Error: errReply(consErr)}, nil
 		}
@@ -455,6 +465,49 @@ func (s *grpcKVService) QueryTxDecision(ctx context.Context, req *pb.QueryTxDeci
 		Decision: txStatusToString(rec.Decision),
 		Error:    errReply(OK),
 	}, nil
+}
+
+// SetRouterAndRecover 设置 ShardRouter 并触发 Coordinator 恢复。
+// 由客户端在创建 Clerk 后调用，以便服务端能够恢复未完成的 COMMITTED 事务。
+func (s *grpcKVService) SetRouterAndRecover(ctx context.Context, req *pb.SetRouterAndRecoverRequest) (*pb.SetRouterAndRecoverResponse, error) {
+	if s.kv.killed() {
+		return &pb.SetRouterAndRecoverResponse{Error: errReply(ErrWrongLeader)}, nil
+	}
+
+	// 将 protobuf 格式转换为 ShardingConfig
+	cfg := sharding.ShardingConfig{
+		NumShards:         int(req.GetNumShards()),
+		VirtualNodeCount:  int(req.GetVirtualNodeCount()),
+		PreferredReplicas: int(req.GetPreferredReplicas()),
+	}
+
+	if req.GetConnectTimeoutMs() > 0 {
+		cfg.ConnectTimeout = time.Duration(req.GetConnectTimeoutMs()) * time.Millisecond
+	}
+	if req.GetRequestTimeoutMs() > 0 {
+		cfg.RequestTimeout = time.Duration(req.GetRequestTimeoutMs()) * time.Millisecond
+	}
+
+	cfg.Groups = make([]sharding.RaftGroupConfig, 0, len(req.GetGroups()))
+	for _, g := range req.GetGroups() {
+		cfg.Groups = append(cfg.Groups, sharding.RaftGroupConfig{
+			GroupID:   int(g.GetGroupId()),
+			Replicas:  append([]string(nil), g.GetReplicas()...),
+			LeaderIdx: int(g.GetLeaderIdx()),
+		})
+	}
+
+	// 创建 ShardRouter
+	router, err := sharding.NewShardRouter(cfg)
+	if err != nil {
+		log.Printf("[SetRouterAndRecover] create router failed: %v", err)
+		return &pb.SetRouterAndRecoverResponse{Error: fmt.Sprintf("create router: %v", err)}, nil
+	}
+
+	// 设置 router 并触发恢复
+	s.kv.txMgr.SetRouterAndRecover(router)
+
+	return &pb.SetRouterAndRecoverResponse{Error: errReply(OK)}, nil
 }
 
 func txStatusToString(status TxStatus) string {

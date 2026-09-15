@@ -31,6 +31,9 @@ service KVService {
   rpc AbortTx(AbortTxRequest) returns (AbortTxResponse);
   rpc ResolveTxStatus(ResolveTxStatusRequest) returns (ResolveTxStatusResponse);
   rpc QueryTxDecision(QueryTxDecisionRequest) returns (QueryTxDecisionResponse);
+
+  // Coordinator 恢复
+  rpc SetRouterAndRecover(SetRouterAndRecoverRequest) returns (SetRouterAndRecoverResponse);
 }
 
 // ============ 基础操作 ============
@@ -253,4 +256,25 @@ message QueryTxDecisionRequest {
 message QueryTxDecisionResponse {
   string decision = 1;  // "COMMITTED" / "ABORTED" / "UNKNOWN"
   string error = 2;
+}
+
+// ============ Coordinator 恢复 ============
+
+message RaftGroupConfig {
+  int32 group_id = 1;
+  repeated string replicas = 2;
+  int32 leader_idx = 3;
+}
+
+message SetRouterAndRecoverRequest {
+  repeated RaftGroupConfig groups = 1;
+  int32 num_shards = 2;
+  int32 virtual_node_count = 3;
+  int32 connect_timeout_ms = 4;
+  int32 request_timeout_ms = 5;
+  int32 preferred_replicas = 6;
+}
+
+message SetRouterAndRecoverResponse {
+  string error = 1;
 }

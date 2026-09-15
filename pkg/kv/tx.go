@@ -53,6 +53,26 @@ func NewTxManager(kv *KVServer, router *sharding.ShardRouter) *TxManager {
 	}
 }
 
+// SetRouterAndRecover 设置 ShardRouter 并触发 Coordinator 事务恢复。
+// 幂等：如果 router 已设置，直接返回。
+// 应该在客户端创建 ShardRouter 后调用，以便服务端能够恢复未完成的 COMMITTED 事务。
+func (tm *TxManager) SetRouterAndRecover(router *sharding.ShardRouter) {
+	tm.mu.Lock()
+	if tm.router != nil {
+		// 已经设置过 router，跳过
+		tm.mu.Unlock()
+		return
+	}
+	tm.router = router
+	tm.mu.Unlock()
+
+	// 创建 TxCoordinator 并触发恢复
+	coordinator := NewTxCoordinator(router)
+	tm.RecoverCoordinatorTransactions(coordinator)
+
+	log.Printf("[TxManager] Router set and coordinator recovery completed")
+}
+
 // RebuildLockTable 扫描所有 _tx:prepare:* 记录并重建内存中的 lock table
 // 和 preparedTxs 缓存。在启动时和快照恢复后调用。
 func (tm *TxManager) RebuildLockTable() error {
@@ -233,7 +253,7 @@ func (tm *TxManager) RecoverCoordinatorTransactions(coordinator *TxCoordinator) 
 	}
 
 	for key, raw := range decisions {
-		txID := strings.TrimPrefix(key, txDecisionPrefix)
+		txID := strings.TrimPrefix(key, "_tx:"+txDecisionPrefix)
 
 		var rec txDecisionRecord
 		if err := json.Unmarshal(raw, &rec); err != nil {
@@ -264,27 +284,31 @@ func (tm *TxManager) RecoverCoordinatorTransactions(coordinator *TxCoordinator) 
 		}
 
 		if !allCompleted {
-			// 从 prepare 记录重建 writeKeys
-			prepareRaw, found, _ := tm.kv.store.GetTxRecord(txPreparePrefix + txID)
-			if !found {
-				log.Printf("[TxManager] RecoverCoordinatorTransactions: 未找到 prepare 记录 %s", txID)
-				continue
-			}
-
-			var prepareRec preparedTxRecord
-			if err := json.Unmarshal(prepareRaw, &prepareRec); err != nil {
-				log.Printf("[TxManager] RecoverCoordinatorTransactions: prepare 记录损坏 %s: %v", txID, err)
-				continue
-			}
-
-			// 按 Group 分组 writeKeys
-			writeKeysByGroup := make(map[int][]WriteKey)
-			for _, wk := range prepareRec.WriteKeys {
-				// 需要通过 router 确定 key 所属的 group
-				// 这里简化处理，从 ParticipantGroupIDs 推断
-				for _, gid := range rec.ParticipantGroupIDs {
-					writeKeysByGroup[gid] = append(writeKeysByGroup[gid], wk)
+			// 从 decision 记录中获取 writeKeys（如果有）
+			var writeKeys []WriteKey
+			if len(rec.WriteKeys) > 0 {
+				writeKeys = rec.WriteKeys
+			} else {
+				// 兜底：从 prepare 记录重建
+				prepareRaw, found, _ := tm.kv.store.GetTxRecord(txPreparePrefix + txID)
+				if !found {
+					log.Printf("[TxManager] RecoverCoordinatorTransactions: 未找到 prepare 记录 %s", txID)
+					continue
 				}
+
+				var prepareRec preparedTxRecord
+				if err := json.Unmarshal(prepareRaw, &prepareRec); err != nil {
+					log.Printf("[TxManager] RecoverCoordinatorTransactions: prepare 记录损坏 %s: %v", txID, err)
+					continue
+				}
+				writeKeys = prepareRec.WriteKeys
+			}
+
+			// 按 Group 分组 writeKeys：使用 router 确定每个 key 的 group
+			writeKeysByGroup := make(map[int][]WriteKey)
+			for _, wk := range writeKeys {
+				gid := tm.router.Resolve(wk.Key)
+				writeKeysByGroup[gid] = append(writeKeysByGroup[gid], wk)
 			}
 
 			// 重启后台重试
@@ -387,8 +411,9 @@ func (tm *TxManager) Prepare(args *PrepareTxArgs) PrepareTxReply {
 }
 
 type txDecisionRecord struct {
-	Decision            TxStatus `json:"decision"`
-	ParticipantGroupIDs []int    `json:"participant_group_ids"`
+	Decision            TxStatus   `json:"decision"`
+	ParticipantGroupIDs []int      `json:"participant_group_ids"`
+	WriteKeys           []WriteKey `json:"write_keys,omitempty"` // 用于恢复 Phase 2
 }
 
 func (tm *TxManager) RecordDecision(args *RecordTxDecisionArgs) RecordTxDecisionReply {
@@ -403,7 +428,13 @@ func (tm *TxManager) RecordDecision(args *RecordTxDecisionArgs) RecordTxDecision
 		}
 		return RecordTxDecisionReply{Err: ErrTxConflict}
 	}
-	raw, err := json.Marshal(txDecisionRecord{Decision: args.Decision, ParticipantGroupIDs: append([]int(nil), args.ParticipantGroupIDs...)})
+
+	// 使用调用者传入的 writeKeys（Client 应该传递所有 Participants 的 writeKeys）
+	raw, err := json.Marshal(txDecisionRecord{
+		Decision:            args.Decision,
+		ParticipantGroupIDs: append([]int(nil), args.ParticipantGroupIDs...),
+		WriteKeys:           append([]WriteKey(nil), args.WriteKeys...),
+	})
 	if err != nil || tm.kv.store.PutTxRecord(key, raw) != nil {
 		return RecordTxDecisionReply{Err: ErrWrongLeader}
 	}
