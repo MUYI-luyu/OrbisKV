@@ -7,6 +7,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	pb "kvraft/api/pb/kvraft/api/pb"
 	"kvraft/pkg/sharding"
@@ -364,6 +365,9 @@ func TestCoordinatorCommitSingleGroup(t *testing.T) {
 		t.Fatalf("Commit 应返回 OK，实际: %s", err)
 	}
 
+	// Wait for Phase 2 completion (async background commit)
+	time.Sleep(200 * time.Millisecond)
+
 	// 验证 server 端数据已更新
 	mock.mu.Lock()
 	kvA := mock.kv["a"]
@@ -685,6 +689,9 @@ func TestCoordinatorManyKeysTransaction(t *testing.T) {
 		t.Fatalf("%d 个 key 的事务 Commit 应返回 OK，实际: %s", numKeys, err)
 	}
 
+	// Wait for Phase 2 completion (async background commit)
+	time.Sleep(200 * time.Millisecond)
+
 	// 验证所有 key 已更新
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
@@ -815,6 +822,9 @@ func TestClerkBeginIntegration(t *testing.T) {
 	if err != OK {
 		t.Fatalf("Clerk.Begin → Commit 应返回 OK，实际: %s", err)
 	}
+
+	// Wait for Phase 2 completion (async background commit)
+	time.Sleep(200 * time.Millisecond)
 
 	mock.mu.Lock()
 	kv := mock.kv["x"]

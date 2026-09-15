@@ -170,12 +170,6 @@ func (st *ShardTopology) PlanAddGroup(gid int, replicas []string) ([]int, []int)
 	return owners, moved
 }
 
-func (st *ShardTopology) GroupReplicas(gid int) []string {
-	st.mu.RLock()
-	defer st.mu.RUnlock()
-	return append([]string(nil), st.groups[gid]...)
-}
-
 // GroupIDs 返回所有 group ID（升序）。
 func (st *ShardTopology) GroupIDs() []int {
 	st.mu.RLock()
@@ -216,50 +210,6 @@ func (st *ShardTopology) MoveShard(shard int, toGroup int) bool {
 	st.shardToGroup[shard] = toGroup
 	st.epoch.Add(1)
 	return true
-}
-
-// AddGroup 动态增加一个新 group 并重新均衡 shard（将已有 group 的部分 shard 转移给新 group）。
-// 返回被转移到新 group 的 shard 列表。
-func (st *ShardTopology) AddGroup(gid int, replicas []string) []int {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
-	if _, exists := st.groups[gid]; exists {
-		return nil
-	}
-	st.groups[gid] = append([]string(nil), replicas...)
-
-	// 重新均衡：每个 group 应拥有 numShards / len(groups) 个 shard
-	newCount := len(st.groups)
-	targetPerGroup := st.numShards / newCount
-
-	// 统计当前分布
-	owned := make(map[int][]int) // groupID → shard list
-	for s := 0; s < st.numShards; s++ {
-		g := st.shardToGroup[s]
-		owned[g] = append(owned[g], s)
-	}
-
-	// 选出需要转移的 shard（从超额 group 中取）
-	var moved []int
-	for _, g := range st.allGroupIDsLocked() {
-		if g == gid {
-			continue
-		}
-		shards := owned[g]
-		for len(shards) > targetPerGroup && len(owned[gid]) < targetPerGroup {
-			// 取最后一个 shard 转移给新 group
-			s := shards[len(shards)-1]
-			shards = shards[:len(shards)-1]
-			st.shardToGroup[s] = gid
-			owned[gid] = append(owned[gid], s)
-			moved = append(moved, s)
-		}
-	}
-	if len(moved) > 0 {
-		st.epoch.Add(1)
-	}
-	return moved
 }
 
 func (st *ShardTopology) allGroupIDsLocked() []int {

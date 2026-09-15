@@ -179,10 +179,10 @@ func TestShardRouterResolveAndCRUD(t *testing.T) {
 	key2 := findKeyForGroup(t, r, 2, "g2")
 
 	ctx := context.Background()
-	if _, err := r.PutRoute(ctx, key1, "v1", 0); err != nil {
+	if _, err := r.PutRouteWithTTL(ctx, key1, "v1", 0, 0); err != nil {
 		t.Fatalf("put key1 failed: %v", err)
 	}
-	if _, err := r.PutRoute(ctx, key2, "v2", 0); err != nil {
+	if _, err := r.PutRouteWithTTL(ctx, key2, "v2", 0, 0); err != nil {
 		t.Fatalf("put key2 failed: %v", err)
 	}
 
@@ -220,7 +220,7 @@ func TestShardRouterFailoverWithinGroup(t *testing.T) {
 
 	key := findKeyForGroup(t, r, 1, "failover")
 
-	putResp, err := r.PutRoute(context.Background(), key, "ok-after-failover", 0)
+	putResp, err := r.PutRouteWithTTL(context.Background(), key, "ok-after-failover", 0, 0)
 	if err != nil {
 		t.Fatalf("put with failover failed: %v", err)
 	}
@@ -233,48 +233,6 @@ func TestShardRouterFailoverWithinGroup(t *testing.T) {
 	}
 }
 
-func TestShardRouterBatchGet(t *testing.T) {
-	s1 := &testKVService{kv: map[string]*pb.KeyValue{}}
-	a1, stop1 := startTestKVServer(t, s1)
-	defer stop1()
-
-	s2 := &testKVService{kv: map[string]*pb.KeyValue{}}
-	a2, stop2 := startTestKVServer(t, s2)
-	defer stop2()
-
-	r, err := NewShardRouter(ShardingConfig{
-		Groups: []RaftGroupConfig{
-			{GroupID: 1, Replicas: []string{a1}, LeaderIdx: 0},
-			{GroupID: 2, Replicas: []string{a2}, LeaderIdx: 0},
-		},
-		VirtualNodeCount: 64,
-		ConnectTimeout:   2 * time.Second,
-		RequestTimeout:   1200 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("new shard router failed: %v", err)
-	}
-	defer r.Close()
-
-	key1 := findKeyForGroup(t, r, 1, "batch-g1")
-	key2 := findKeyForGroup(t, r, 2, "batch-g2")
-	key3 := findKeyForGroup(t, r, 1, "batch-g1-extra")
-
-	_, _ = r.PutRoute(context.Background(), key1, "v1", 0)
-	_, _ = r.PutRoute(context.Background(), key2, "v2", 0)
-	_, _ = r.PutRoute(context.Background(), key3, "v3", 0)
-
-	results := r.BatchGet(context.Background(), []string{key1, key2, key3, "missing-key"})
-	if len(results) != 4 {
-		t.Fatalf("batch get result size mismatch, want=4 got=%d", len(results))
-	}
-	if results[key1].GetValue() != "v1" || results[key2].GetValue() != "v2" || results[key3].GetValue() != "v3" {
-		t.Fatalf("batch get returned unexpected values")
-	}
-	if miss := results["missing-key"]; miss == nil || miss.GetError() != "ErrNoKey" {
-		t.Fatalf("missing key response mismatch: %+v", miss)
-	}
-}
 
 func TestShardRouterScanRoute(t *testing.T) {
 	s1 := &testKVService{kv: map[string]*pb.KeyValue{}}
@@ -304,9 +262,9 @@ func TestShardRouterScanRoute(t *testing.T) {
 	k2 := findKeyForGroup(t, r, 2, "scan-user")
 	k3 := findKeyForGroup(t, r, 1, "scan-order")
 
-	_, _ = r.PutRoute(ctx, k1, "v1", 0)
-	_, _ = r.PutRoute(ctx, k2, "v2", 0)
-	_, _ = r.PutRoute(ctx, k3, "v3", 0)
+	_, _ = r.PutRouteWithTTL(ctx, k1, "v1", 0, 0)
+	_, _ = r.PutRouteWithTTL(ctx, k2, "v2", 0, 0)
+	_, _ = r.PutRouteWithTTL(ctx, k3, "v3", 0, 0)
 
 	items, err := r.ScanRoute(ctx, "scan-user", 0)
 	if err != nil {

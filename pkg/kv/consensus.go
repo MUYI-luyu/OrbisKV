@@ -436,10 +436,10 @@ func (rsm *RSM) recoverFromWAL(snapshotIndex int) (int, error) {
 	err := rsm.walLogger.Replay(func(entry wal.Entry) error {
 		entryIndex := int(entry.RaftIndex)
 		if entryIndex <= snapshotIndex {
-			return nil
+			return nil // 跳过已经在 snapshot 中的
 		}
 		if entryIndex <= recoveredIndex {
-			return nil
+			return nil // 跳过重复的
 		}
 
 		req, mutates, err := walEntryToRequest(entry)
@@ -447,7 +447,7 @@ func (rsm *RSM) recoverFromWAL(snapshotIndex int) (int, error) {
 			return err
 		}
 		if mutates {
-			rsm.sm.DoOp(req)
+			rsm.sm.DoOp(req) // 重新执行 Put/Delete/事务操作
 		}
 		recoveredIndex = entryIndex
 		return nil

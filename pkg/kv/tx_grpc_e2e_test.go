@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	pb "kvraft/api/pb/kvraft/api/pb"
 	"kvraft/pkg/sharding"
@@ -101,6 +102,10 @@ func TestCrossShard2PCGRPCEndToEnd(t *testing.T) {
 	if err := tx.Commit(); err != OK {
 		t.Fatalf("cross-group commit: %s", err)
 	}
+
+	// 等待 Phase 2 完成（后台异步）
+	time.Sleep(200 * time.Millisecond)
+
 	value1, version1, _, err1 := ck.Get(key1)
 	value2, version2, _, err2 := ck.Get(key2)
 	if err1 != OK || err2 != OK || value1 != "one" || value2 != "two" || version1 != 2 || version2 != 2 {
